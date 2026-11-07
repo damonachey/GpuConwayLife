@@ -5,15 +5,29 @@ Conway's Game of Life running entirely on the GPU, written in Rust with
 
 ## How it works
 
-- The grid (1000×1000, wrapping edges, one cell per screen pixel) is stored in
-  two GPU storage buffers.
-- Each frame, a **compute shader** (`src/life.wgsl`) reads one buffer and writes
-  the next generation into the other, and the buffers swap roles (ping-pong).
-- A **fragment shader** (`src/render.wgsl`) draws the newest buffer straight to
-  the window. Cell data never round-trips through the CPU after the initial seed.
-
+- Cells are **bit-packed**, 32 to a `u32`, in two GPU storage buffers
+  (ping-pong). The grid is as large as the GPU allows, up to 2 GiB per buffer:
+  on an RTX 3070 that's **131,040 × 131,040 ≈ 17.2 billion cells**. If the
+  allocation fails, the grid shrinks until it fits.
+- **Edges are dead**: everything beyond the grid counts as empty, so patterns
+  that reach the border die there instead of wrapping.
+- A **compute shader** (`src/life.wgsl`) computes 32 cells per thread: it shifts
+  the 9 surrounding words into 8 neighbour words and adds them with a bitwise
+  adder, so all 32 neighbour counts happen in parallel.
+- Random soup is generated **on the GPU** (a hash per word), and the
+  population is counted on the GPU and read back in the background.
+- A **fragment shader** (`src/render.wgsl`) draws the middle of the grid, one
+  cell per screen pixel. Cell data never round-trips through the CPU.
 - A small overlay (`src/overlay.wgsl`, built-in 3x5 pixel font) shows FPS,
-  generation count, generations/second and speed.
+  generations/second, cell updates/second, population, speed and grid size.
+- Each frame does at most ~100 ms of simulation, so huge grids at high speed
+  stay responsive (excess requested generations are dropped).
+
+Measured on an RTX 3070: ~1.4 trillion cell updates/second on large grids,
+versus ~22 billion with the previous one-`u32`-per-cell version. Verified with
+the acorn, which reaches its known final population of 633.
+
+Set `LIFE_GRID=<side>` to pick a smaller square grid, e.g. `LIFE_GRID=4096`.
 
 ## Controls
 

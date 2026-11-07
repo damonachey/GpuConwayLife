@@ -1,10 +1,12 @@
-// Draws the grid at native resolution: one cell = one screen pixel.
+// Draws the bit-packed grid at native resolution: one cell = one screen pixel.
 // One full-screen triangle; the fragment shader maps each pixel to a cell.
-// The grid is centred in the window; outside it is a darker border.
+// The grid's centre is drawn at the window's centre; anything outside is a border.
 
 struct View {
-    grid: vec2<u32>,   // grid size in cells
-    offset: vec2<i32>, // screen pixel where cell (0, 0) is drawn (may be negative)
+    grid: vec2<u32>,     // grid size in cells
+    offset: vec2<i32>,   // screen pixel where cell (0, 0) is drawn (may be negative)
+    words_per_row: u32,
+    _pad: u32,
 }
 
 @group(0) @binding(0) var<uniform> view: View;
@@ -27,6 +29,8 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     if (c.x < 0 || c.y < 0 || c.x >= i32(view.grid.x) || c.y >= i32(view.grid.y)) {
         return vec4<f32>(border_color, 1.0);
     }
-    let alive = cells[u32(c.y) * view.grid.x + u32(c.x)];
+    let x = u32(c.x);
+    let word = cells[u32(c.y) * view.words_per_row + (x >> 5u)];
+    let alive = (word >> (x & 31u)) & 1u;
     return vec4<f32>(select(dead_color, live_color, alive == 1u), 1.0);
 }

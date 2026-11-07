@@ -65,20 +65,15 @@ pub const ARK1: &[&str] = &[
     "...OOOO.........................",
 ];
 
-/// An empty `width` x `height` grid with `pattern` stamped in the centre.
-pub fn centered(pattern: &[&str], width: u32, height: u32) -> Vec<u32> {
-    let (w, h) = (width as usize, height as usize);
-    let pat_h = pattern.len();
-    let pat_w = pattern.iter().map(|r| r.len()).max().unwrap_or(0);
-    let x0 = w.saturating_sub(pat_w) / 2;
-    let y0 = h.saturating_sub(pat_h) / 2;
-
-    let mut cells = vec![0; w * h];
-    for (dy, row) in pattern.iter().enumerate() {
-        for (dx, b) in row.bytes().enumerate() {
-            let (x, y) = (x0 + dx, y0 + dy);
-            if b == b'O' && x < w && y < h {
-                cells[y * w + x] = 1;
+/// Live cells of `pattern` as (x, y) offsets centred on (0, 0).
+pub fn centered(pattern: &[&str]) -> Vec<(i32, i32)> {
+    let h = pattern.len() as i32;
+    let w = pattern.iter().map(|r| r.len()).max().unwrap_or(0) as i32;
+    let mut cells = Vec::new();
+    for (y, row) in pattern.iter().enumerate() {
+        for (x, b) in row.bytes().enumerate() {
+            if b == b'O' {
+                cells.push((x as i32 - w / 2, y as i32 - h / 2));
             }
         }
     }
