@@ -21,7 +21,8 @@ const TILE: u32 = 128u;
 const MARGIN: u32 = 64u;
 const WORDS_PER_ROW: u32 = TILE / 32u;
 const TILE_WORDS: u32 = TILE * WORDS_PER_ROW;
-const THREADS: u32 = 256u;
+// One thread per word, up to 256 (the most every wgpu device must allow).
+const THREADS: u32 = min(TILE_WORDS, 256u);
 const EMPTY: u32 = 0xffffffffu;
 // The tile plus a border: rows -1..TILE, word columns -1..WORDS_PER_ROW.
 const HALO_COLS: u32 = WORDS_PER_ROW + 2u;
@@ -93,7 +94,7 @@ fn add_bit(s: ptr<function, vec3<u32>>, x: u32) {
     (*s).z |= c1;
 }
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(THREADS)
 fn step(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(num_workgroups) nwg: vec3<u32>,
