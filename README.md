@@ -6,8 +6,8 @@ Conway's Game of Life running entirely on the GPU, written in Rust with
 ## How it works
 
 - Cells are **bit-packed**, 32 to a `u32`, in two GPU storage buffers
-  (ping-pong). The default grid is **32,768 × 32,768 ≈ 1.07 billion cells**
-  (128 MiB per buffer). `LIFE_GRID` can go up to what the GPU allows, up to
+  (ping-pong). The default grid is **16,384 × 16,384 ≈ 268 million cells**
+  (32 MiB per buffer). `LIFE_GRID` can go up to what the GPU allows, up to
   2 GiB per buffer: on an RTX 3070 that's 131,040 × 131,040 ≈ 17.2 billion
   cells. If the allocation fails, the grid shrinks until it fits.
 - **Edges are dead**: everything beyond the grid counts as empty, so patterns

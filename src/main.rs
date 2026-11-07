@@ -25,10 +25,10 @@ use winit::window::{Window, WindowId};
 
 /// Upper bound on each of the two cell buffers (most GPUs allow ~2 GiB per binding).
 const MAX_BUFFER_BYTES: u64 = 2 << 30;
-/// Default grid side: 32768² ≈ 1.07 billion cells (128 MiB per buffer). Big enough
-/// for most patterns to run free, small enough to stay fast. `LIFE_GRID` can go
-/// higher, up to what the GPU allows.
-const DEFAULT_GRID_SIDE: u32 = 32768;
+/// Default grid side: 16384² ≈ 268 million cells (32 MiB per buffer). Plenty of
+/// room for most patterns' cores, and fast (~5,000 generations/s on an RTX 3070).
+/// `LIFE_GRID` can go higher, up to what the GPU allows.
+const DEFAULT_GRID_SIDE: u32 = 16384;
 /// Matches `@workgroup_size(64, 4)` in life.wgsl: 64 words across, 4 rows down.
 const WORKGROUP_SIZE: (u32, u32) = (64, 4);
 
