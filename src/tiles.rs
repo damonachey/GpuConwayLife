@@ -32,6 +32,25 @@ pub const MARGIN: u32 = 64;
 /// Generations between bookkeeping passes. Readbacks are applied one pass late, so
 /// this must be at most MARGIN / 2.
 pub const BOOKKEEPING_INTERVAL: u32 = MARGIN / 2;
+
+// The shaders rely on these: rows are whole words (TILE % 32), the render shader
+// divides by shifting (power of two), and a word is never near both the west and
+// east edges (MARGIN % 32). Pipelined readbacks need 2 * interval <= MARGIN.
+const _: () = assert!(TILE.is_power_of_two() && TILE % 32 == 0);
+const _: () = assert!(MARGIN % 32 == 0 && MARGIN <= TILE / 2);
+const _: () = assert!(2 * BOOKKEEPING_INTERVAL <= MARGIN);
+
+/// WGSL `const` declarations for the tile constants, prepended to the sparse
+/// shaders so this file is the only place they're defined.
+pub fn shader_constants() -> String {
+    format!(
+        "const TILE: u32 = {TILE}u;\n\
+         const TILE_SHIFT: u32 = {}u;\n\
+         const MARGIN: u32 = {MARGIN}u;\n\
+         const POP_SHIFT: u32 = {POP_SHIFT}u;\n",
+        TILE.trailing_zeros()
+    )
+}
 /// Neighbour-table entry for "no tile here".
 pub const EMPTY: u32 = u32::MAX;
 /// Flag bit: the tile has at least one live cell.
@@ -39,7 +58,7 @@ pub const ALIVE: u32 = 1;
 /// Flags bits 16.. hold the tile's live-cell count.
 pub const POP_SHIFT: u32 = 16;
 /// Neighbour directions as (dx, dy), y pointing down. Flag bit `1 << (1 + d)` means
-/// "tile needs neighbour `d`". Note `DIRS[7 - d]` is the opposite of `DIRS[d]`.
+/// "tile needs neighbour `d`" (see [`need_bit`]); [`opposite`] flips a direction.
 pub const DIRS: [(i32, i32); 8] =
     [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)];
 
@@ -49,6 +68,16 @@ pub type TileCoord = (i32, i32);
 pub fn dir_index(dx: i32, dy: i32) -> usize {
     let k = ((dy + 1) * 3 + (dx + 1)) as usize;
     if k < 4 { k } else { k - 1 }
+}
+
+/// Flag bit meaning "this tile needs its neighbour at offset (dx, dy)".
+pub fn need_bit(dx: i32, dy: i32) -> u32 {
+    2 << dir_index(dx, dy)
+}
+
+/// The direction opposite to `d` (`DIRS` is laid out symmetrically).
+pub fn opposite(d: usize) -> usize {
+    7 - d
 }
 
 /// Flags for one tile's bit-packed words ([`TILE_WORDS`] of them): [`ALIVE`], a bit
@@ -74,13 +103,13 @@ fn cell_flags(x: u32, y: u32) -> u32 {
     let dy = if y < MARGIN { -1 } else if y >= TILE - MARGIN { 1 } else { 0 };
     let mut f = ALIVE;
     if dx != 0 {
-        f |= 2 << dir_index(dx, 0);
+        f |= need_bit(dx, 0);
     }
     if dy != 0 {
-        f |= 2 << dir_index(0, dy);
+        f |= need_bit(0, dy);
     }
     if dx != 0 && dy != 0 {
-        f |= 2 << dir_index(dx, dy);
+        f |= need_bit(dx, dy);
     }
     f
 }
@@ -189,7 +218,7 @@ impl TileWorld {
         for (d, &(dx, dy)) in DIRS.iter().enumerate() {
             if let Some(&n) = self.map.get(&(coord.0 + dx, coord.1 + dy)) {
                 row[d] = n;
-                self.neighbors[n as usize][7 - d] = slot;
+                self.neighbors[n as usize][opposite(d)] = slot;
                 self.dirty_neighbors.insert(n);
             }
         }
@@ -204,7 +233,7 @@ impl TileWorld {
         let Some(slot) = self.map.remove(&coord) else { return };
         for (d, &(dx, dy)) in DIRS.iter().enumerate() {
             if let Some(&n) = self.map.get(&(coord.0 + dx, coord.1 + dy)) {
-                self.neighbors[n as usize][7 - d] = EMPTY;
+                self.neighbors[n as usize][opposite(d)] = EMPTY;
                 self.dirty_neighbors.insert(n);
             }
         }
@@ -232,8 +261,8 @@ impl TileWorld {
             if f & ALIVE != 0 {
                 needed.insert((x, y));
             }
-            for (d, &(dx, dy)) in DIRS.iter().enumerate() {
-                if f & (2 << d) != 0 {
+            for &(dx, dy) in &DIRS {
+                if f & need_bit(dx, dy) != 0 {
                     needed.insert((x + dx, y + dy));
                 }
             }
@@ -278,7 +307,7 @@ mod tests {
     fn dir_index_matches_dirs_and_opposites() {
         for (d, &(dx, dy)) in DIRS.iter().enumerate() {
             assert_eq!(dir_index(dx, dy), d);
-            assert_eq!(DIRS[7 - d], (-dx, -dy));
+            assert_eq!(DIRS[opposite(d)], (-dx, -dy));
         }
     }
 
@@ -294,20 +323,13 @@ mod tests {
 
     #[test]
     fn cell_flags_regions() {
-        let need = |dx, dy| 2 << dir_index(dx, dy);
         // Corners need their two edge neighbours and the diagonal one.
-        assert_eq!(cell_flags(0, 0), ALIVE | need(-1, 0) | need(0, -1) | need(-1, -1));
-        assert_eq!(cell_flags(TILE - 1, TILE - 1), ALIVE | need(1, 0) | need(0, 1) | need(1, 1));
+        assert_eq!(cell_flags(0, 0), ALIVE | need_bit(-1, 0) | need_bit(0, -1) | need_bit(-1, -1));
+        assert_eq!(cell_flags(TILE - 1, TILE - 1), ALIVE | need_bit(1, 0) | need_bit(0, 1) | need_bit(1, 1));
         // Just inside the margin on the east side, just outside it on the south.
         let (x, y) = (TILE - MARGIN, TILE - MARGIN - 1);
-        let expected_y = if y < MARGIN { need(0, -1) | need(1, -1) } else { 0 };
-        assert_eq!(cell_flags(x, y), ALIVE | need(1, 0) | expected_y);
-    }
-
-    #[test]
-    fn margin_constraints_hold() {
-        // Pipelined readbacks are applied one pass late (see module docs).
-        const { assert!(2 * BOOKKEEPING_INTERVAL <= MARGIN && MARGIN <= TILE / 2) };
+        let expected_y = if y < MARGIN { need_bit(0, -1) | need_bit(1, -1) } else { 0 };
+        assert_eq!(cell_flags(x, y), ALIVE | need_bit(1, 0) | expected_y);
     }
 
     #[test]
@@ -349,7 +371,7 @@ mod tests {
         let flags: Vec<u32> = w
             .active()
             .iter()
-            .map(|&s| if w.coords[s as usize] == (0, 0) { ALIVE | 2 << dir_index(1, 0) } else { 0 })
+            .map(|&s| if w.coords[s as usize] == (0, 0) { ALIVE | need_bit(1, 0) } else { 0 })
             .collect();
         w.update(&flags);
         assert!(w.slot((0, 0)).is_some());

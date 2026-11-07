@@ -2,13 +2,17 @@
 //!
 //! Tiles live in a fixed GPU pool. `sparse_life.wgsl` steps every active tile and
 //! reports which tiles are alive and which neighbours they need; every
-//! `tiles::MARGIN` generations the CPU reads those flags back and allocates or
-//! frees tiles (`tiles.rs`). `sparse_render.wgsl` draws the world one cell per
-//! screen pixel, centred on the origin.
+//! `tiles::BOOKKEEPING_INTERVAL` generations the CPU reads those flags back and
+//! allocates or frees tiles (`tiles.rs`). `sparse_render.wgsl` draws the world one
+//! cell per screen pixel, centred on the origin.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
-use crate::engine::{BYTE_UNITS, Engine, GpuContext, bind, fullscreen_pipeline, human, layout_entry};
+use crate::engine::{
+    BYTE_UNITS, Engine, GpuContext, LIFE_RULE_WGSL, bind, fullscreen_pipeline, human, layout_entry,
+    readback_buffer, shader, storage_buffer, uniform_buffer,
+};
 use crate::patterns;
 use crate::tiles::{self, BOOKKEEPING_INTERVAL, TILE, TILE_CELLS, TILE_WORDS, TileCoord, TileWorld};
 
@@ -40,184 +44,173 @@ struct View {
     _pad: u32,
 }
 
-/// A tile-flags readback that has been submitted but not yet applied.
-struct PendingReadback {
-    /// Which staging buffer it is copying into.
-    staging: usize,
-    submission: wgpu::SubmissionIndex,
-    /// Tiles the flags describe, in flag order (slots may be reused meanwhile).
+/// GPU buffers, all sized for `capacity` tiles.
+struct Buffers {
+    params: wgpu::Buffer,
+    /// Slot of each active tile, in the order the GPU processes them.
+    active: wgpu::Buffer,
+    /// 8 neighbour slots per tile slot.
+    neighbors: wgpu::Buffer,
+    /// The tile pool, ping-ponged each generation.
+    cells: [wgpu::Buffer; 2],
+    /// Per-active-tile flags written by the compute shader.
+    flags: wgpu::Buffer,
+    view: wgpu::Buffer,
+    /// Slot of each tile on screen, for the renderer.
+    tile_map: wgpu::Buffer,
+}
+
+impl Buffers {
+    fn new(device: &wgpu::Device, capacity: u32) -> Self {
+        let cap = u64::from(capacity);
+        let dst = wgpu::BufferUsages::COPY_DST;
+        let pool_bytes = cap * TILE_BYTES;
+        Self {
+            params: uniform_buffer(device, "sparse params", size_of::<Params>() as u64),
+            active: storage_buffer(device, "active tiles", cap * 4, dst),
+            neighbors: storage_buffer(device, "tile neighbours", cap * 32, dst),
+            cells: [0, 1].map(|i| storage_buffer(device, &format!("tile cells {i}"), pool_bytes, dst)),
+            flags: storage_buffer(device, "tile flags", cap * 4, wgpu::BufferUsages::COPY_SRC),
+            view: uniform_buffer(device, "sparse view", size_of::<View>() as u64),
+            tile_map: storage_buffer(
+                device,
+                "view tile map",
+                u64::from(MAX_VIEW_TILES * MAX_VIEW_TILES) * 4,
+                dst,
+            ),
+        }
+    }
+}
+
+/// Pipelines and bind groups. `bind_groups[i]` reads (compute) or draws (render)
+/// cell buffer `i`; compute writes buffer `1 - i`.
+struct Pipeline<P> {
+    pipeline: P,
+    bind_groups: [wgpu::BindGroup; 2],
+}
+
+/// Tile flags read back from the GPU, and which tiles they describe.
+struct Flags {
+    values: Vec<u32>,
+    /// Tile of each flag, in order (slots may have been reused since).
     coords: Vec<TileCoord>,
     generation: u64,
+}
+
+/// Pipelined flags readback: each bookkeeping point starts copying the current
+/// flags into one staging buffer and collects the previous point's copy from the
+/// other, so the GPU never waits on the CPU. See tiles.rs for why applying flags
+/// one pass late is safe.
+struct FlagReadback {
+    staging: [wgpu::Buffer; 2],
+    in_flight: Option<InFlight>,
+}
+
+struct InFlight {
+    staging: usize,
+    submission: wgpu::SubmissionIndex,
+    coords: Vec<TileCoord>,
+    generation: u64,
+}
+
+impl FlagReadback {
+    fn new(device: &wgpu::Device, capacity: u32) -> Self {
+        let bytes = u64::from(capacity) * 4;
+        Self {
+            staging: [0, 1].map(|i| readback_buffer(device, &format!("tile flags readback {i}"), bytes)),
+            in_flight: None,
+        }
+    }
+
+    /// Start reading back `flags` (one per tile in `coords`, as of `generation`),
+    /// and return the previous readback's result, if there was one.
+    fn swap(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        flags: &wgpu::Buffer,
+        coords: Vec<TileCoord>,
+        generation: u64,
+    ) -> Option<Flags> {
+        let previous = self.in_flight.take();
+        if !coords.is_empty() {
+            let staging = previous.as_ref().map_or(0, |p| 1 - p.staging);
+            let bytes = (coords.len() * 4) as u64;
+            let mut encoder = device.create_command_encoder(&Default::default());
+            encoder.copy_buffer_to_buffer(flags, 0, &self.staging[staging], 0, bytes);
+            let submission = queue.submit([encoder.finish()]);
+            self.staging[staging].map_async(wgpu::MapMode::Read, 0..bytes, |r| {
+                r.expect("map tile flags");
+            });
+            self.in_flight = Some(InFlight { staging, submission, coords, generation });
+        }
+        previous.map(|p| self.collect(device, p))
+    }
+
+    /// Drop any in-flight readback (e.g. when the world is replaced).
+    fn discard(&mut self, device: &wgpu::Device) {
+        if let Some(in_flight) = self.in_flight.take() {
+            self.collect(device, in_flight);
+        }
+    }
+
+    /// Wait for a readback (normally long finished) and take its flags.
+    fn collect(&self, device: &wgpu::Device, in_flight: InFlight) -> Flags {
+        // Wait for that submission only, not for everything queued since.
+        device
+            .poll(wgpu::PollType::Wait { submission_index: Some(in_flight.submission), timeout: None })
+            .expect("wait for tile flags");
+        let buffer = &self.staging[in_flight.staging];
+        let bytes = (in_flight.coords.len() * 4) as u64;
+        let values = {
+            let view = buffer.get_mapped_range(0..bytes).expect("mapped flags");
+            bytemuck::cast_slice::<u8, u32>(&view).to_vec()
+        };
+        buffer.unmap();
+        Flags { values, coords: in_flight.coords, generation: in_flight.generation }
+    }
 }
 
 pub struct SparseEngine {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    step_pipeline: wgpu::ComputePipeline,
-    render_pipeline: wgpu::RenderPipeline,
-    params_buffer: wgpu::Buffer,
-    active_buffer: wgpu::Buffer,
-    neighbor_buffer: wgpu::Buffer,
-    cell_buffers: [wgpu::Buffer; 2],
-    flags_buffer: wgpu::Buffer,
-    /// Two staging buffers, so one readback can be in flight while the previous
-    /// one is applied.
-    flags_staging: [wgpu::Buffer; 2],
-    pending: Option<PendingReadback>,
-    view_buffer: wgpu::Buffer,
-    tile_map_buffer: wgpu::Buffer,
-    /// `compute_bind_groups[i]` reads cell buffer `i` and writes buffer `1 - i`.
-    compute_bind_groups: [wgpu::BindGroup; 2],
-    /// `render_bind_groups[i]` draws cell buffer `i`.
-    render_bind_groups: [wgpu::BindGroup; 2],
+    buffers: Buffers,
+    compute: Pipeline<wgpu::ComputePipeline>,
+    render: Pipeline<wgpu::RenderPipeline>,
+    readback: FlagReadback,
     /// Index of the cell buffer that holds the current generation.
-    current: usize,
+    current_buffer: usize,
 
     world: TileWorld,
-    /// Generations run since the last bookkeeping pass (always < MARGIN).
+    /// Generations run since the last bookkeeping pass (always < BOOKKEEPING_INTERVAL).
     since_bookkeeping: u32,
     zero_tile: Vec<u8>,
     last_view: Option<(View, Vec<u32>)>,
     show_tiles: bool,
     generation: u64,
-    /// Live cells as of the last bookkeeping pass, and that pass's generation.
+    /// Live cells as of the last applied readback, and that readback's generation.
     population: (u64, u64),
     /// Total CPU time spent applying readbacks (for the benchmark).
-    bookkeeping_time: std::time::Duration,
+    bookkeeping_time: Duration,
 }
 
 impl SparseEngine {
     pub fn new(ctx: &GpuContext) -> Self {
-        let device = &ctx.device;
-
         // Size the tile pool from the device's buffer limit, capped by our budget.
         let capacity = (POOL_BUDGET_BYTES.min(ctx.max_buffer) / TILE_BYTES) as u32;
-        let pool_bytes = u64::from(capacity) * TILE_BYTES;
         log::info!(
             "Sparse tile pool: {capacity} tiles of {TILE}x{TILE} ({} MiB per buffer, 2 buffers)",
-            pool_bytes >> 20
+            (u64::from(capacity) * TILE_BYTES) >> 20
         );
-
-        let storage = |label: &str, size: u64, extra: wgpu::BufferUsages| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size,
-                usage: wgpu::BufferUsages::STORAGE | extra,
-                mapped_at_creation: false,
-            })
-        };
-        let uniform = |label: &str, size: u64| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
-        };
-        let cap = u64::from(capacity);
-        let dst = wgpu::BufferUsages::COPY_DST;
-        let params_buffer = uniform("sparse params", size_of::<Params>() as u64);
-        let active_buffer = storage("active tiles", cap * 4, dst);
-        let neighbor_buffer = storage("tile neighbours", cap * 32, dst);
-        let cell_buffers = [0, 1].map(|i| storage(&format!("tile cells {i}"), pool_bytes, dst));
-        let flags_buffer = storage("tile flags", cap * 4, wgpu::BufferUsages::COPY_SRC);
-        let flags_staging = [0, 1].map(|i| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("tile flags readback {i}")),
-                size: cap * 4,
-                usage: wgpu::BufferUsages::MAP_READ | dst,
-                mapped_at_creation: false,
-            })
-        });
-        let view_buffer = uniform("sparse view", size_of::<View>() as u64);
-        let tile_map_buffer =
-            storage("view tile map", u64::from(MAX_VIEW_TILES * MAX_VIEW_TILES) * 4, dst);
-
-        // --- Compute pipeline ----------------------------------------------
-
-        use wgpu::BufferBindingType::{Storage, Uniform};
-        let cs = wgpu::ShaderStages::COMPUTE;
-        let life_shader = device.create_shader_module(wgpu::include_wgsl!("sparse_life.wgsl"));
-        let compute_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("sparse compute layout"),
-            entries: &[
-                layout_entry(0, cs, Uniform),
-                layout_entry(1, cs, Storage { read_only: true }),
-                layout_entry(2, cs, Storage { read_only: true }),
-                layout_entry(3, cs, Storage { read_only: true }),
-                layout_entry(4, cs, Storage { read_only: false }),
-                layout_entry(5, cs, Storage { read_only: false }),
-            ],
-        });
-        let step_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("sparse step"),
-            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("sparse compute pipeline layout"),
-                bind_group_layouts: &[Some(&compute_layout)],
-                ..Default::default()
-            })),
-            module: &life_shader,
-            entry_point: Some("step"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        let compute_bind_groups = [0, 1].map(|i| {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(&format!("sparse compute {i} -> {}", 1 - i)),
-                layout: &compute_layout,
-                entries: &[
-                    bind(0, &params_buffer),
-                    bind(1, &active_buffer),
-                    bind(2, &neighbor_buffer),
-                    bind(3, &cell_buffers[i]),
-                    bind(4, &cell_buffers[1 - i]),
-                    bind(5, &flags_buffer),
-                ],
-            })
-        });
-
-        // --- Render pipeline -----------------------------------------------
-
-        let fs = wgpu::ShaderStages::FRAGMENT;
-        let render_shader = device.create_shader_module(wgpu::include_wgsl!("sparse_render.wgsl"));
-        let render_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("sparse render layout"),
-            entries: &[
-                layout_entry(0, fs, Uniform),
-                layout_entry(1, fs, Storage { read_only: true }),
-                layout_entry(2, fs, Storage { read_only: true }),
-            ],
-        });
-        let render_pipeline = fullscreen_pipeline(ctx, "sparse draw", &render_shader, &render_layout);
-        let render_bind_groups = [0, 1].map(|i| {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(&format!("sparse render {i}")),
-                layout: &render_layout,
-                entries: &[
-                    bind(0, &view_buffer),
-                    bind(1, &tile_map_buffer),
-                    bind(2, &cell_buffers[i]),
-                ],
-            })
-        });
-
+        let buffers = Buffers::new(&ctx.device, capacity);
         Self {
             device: ctx.device.clone(),
             queue: ctx.queue.clone(),
-            step_pipeline,
-            render_pipeline,
-            params_buffer,
-            active_buffer,
-            neighbor_buffer,
-            cell_buffers,
-            flags_buffer,
-            flags_staging,
-            pending: None,
-            view_buffer,
-            tile_map_buffer,
-            compute_bind_groups,
-            render_bind_groups,
-            current: 0,
+            compute: create_compute(ctx, &buffers),
+            render: create_render(ctx, &buffers),
+            readback: FlagReadback::new(&ctx.device, capacity),
+            buffers,
+            current_buffer: 0,
             world: TileWorld::new(capacity),
             since_bookkeeping: 0,
             zero_tile: vec![0; TILE_BYTES as usize],
@@ -225,12 +218,12 @@ impl SparseEngine {
             show_tiles: false,
             generation: 0,
             population: (0, 0),
-            bookkeeping_time: std::time::Duration::ZERO,
+            bookkeeping_time: Duration::ZERO,
         }
     }
 
     /// CPU time spent applying readbacks so far, and reset the counter.
-    pub fn take_bookkeeping_time(&mut self) -> std::time::Duration {
+    pub fn take_bookkeeping_time(&mut self) -> Duration {
         std::mem::take(&mut self.bookkeeping_time)
     }
 
@@ -244,24 +237,24 @@ impl SparseEngine {
         let changes = self.world.take_changes();
         for (slot, row) in &changes.neighbors {
             self.queue.write_buffer(
-                &self.neighbor_buffer,
+                &self.buffers.neighbors,
                 u64::from(*slot) * 32,
                 bytemuck::cast_slice(row),
             );
         }
         for slot in &changes.new_slots {
             self.queue.write_buffer(
-                &self.cell_buffers[self.current],
+                &self.buffers.cells[self.current_buffer],
                 u64::from(*slot) * TILE_BYTES,
                 &self.zero_tile,
             );
         }
         if let Some(active) = &changes.active {
             if !active.is_empty() {
-                self.queue.write_buffer(&self.active_buffer, 0, bytemuck::cast_slice(active));
+                self.queue.write_buffer(&self.buffers.active, 0, bytemuck::cast_slice(active));
             }
             let params = Params { count: active.len() as u32 };
-            self.queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
+            self.queue.write_buffer(&self.buffers.params, 0, bytemuck::bytes_of(&params));
         }
     }
 
@@ -275,86 +268,117 @@ impl SparseEngine {
             let x = count.min(65535);
             let y = count.div_ceil(x);
             let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.step_pipeline);
+            pass.set_pipeline(&self.compute.pipeline);
             for i in 0..n as usize {
-                let src = (self.current + i) % 2;
-                pass.set_bind_group(0, &self.compute_bind_groups[src], &[]);
+                let src = (self.current_buffer + i) % 2;
+                pass.set_bind_group(0, &self.compute.bind_groups[src], &[]);
                 pass.dispatch_workgroups(x, y, 1);
             }
         }
         self.queue.submit([encoder.finish()]);
         if n % 2 == 1 {
-            self.current = 1 - self.current;
+            self.current_buffer = 1 - self.current_buffer;
         }
         self.since_bookkeeping += n;
         self.generation += u64::from(n);
     }
 
-    /// Bookkeeping point: start reading back the current tile flags, then apply the
-    /// readback started at the previous point (long since finished), so the GPU
-    /// never waits on the CPU. See tiles.rs for why applying one pass late is safe.
+    /// Bookkeeping point: start reading back the current flags, and grow / shrink
+    /// the world from the previous point's readback.
     fn bookkeeping(&mut self) {
-        let previous = self.pending.take();
-        self.start_readback(previous.as_ref().map_or(0, |p| 1 - p.staging));
-        if let Some(previous) = previous {
-            let flags = self.finish_readback(&previous);
-            let population = flags.iter().map(|f| u64::from(f >> tiles::POP_SHIFT)).sum();
-            self.population = (population, previous.generation);
-            let start = std::time::Instant::now();
-            self.world.update_from(&previous.coords, &flags);
+        let coords = self.world.active_coords();
+        let previous =
+            self.readback.swap(&self.device, &self.queue, &self.buffers.flags, coords, self.generation);
+        if let Some(flags) = previous {
+            let population = flags.values.iter().map(|f| u64::from(f >> tiles::POP_SHIFT)).sum();
+            self.population = (population, flags.generation);
+            let start = Instant::now();
+            self.world.update_from(&flags.coords, &flags.values);
             self.apply_world_changes();
             self.bookkeeping_time += start.elapsed();
         }
         self.since_bookkeeping = 0;
     }
+}
 
-    /// Copy the current flags into staging buffer `staging` and map it, without
-    /// waiting. Leaves `self.pending` set (unless there are no tiles).
-    fn start_readback(&mut self, staging: usize) {
-        let count = self.world.active().len();
-        if count == 0 {
-            return;
-        }
-        let bytes = (count * 4) as u64;
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        encoder.copy_buffer_to_buffer(&self.flags_buffer, 0, &self.flags_staging[staging], 0, bytes);
-        let submission = self.queue.submit([encoder.finish()]);
-        self.flags_staging[staging].map_async(wgpu::MapMode::Read, 0..bytes, |r| {
-            r.expect("map tile flags");
-        });
-        self.pending = Some(PendingReadback {
-            staging,
-            submission,
-            coords: self.world.active_coords(),
-            generation: self.generation,
-        });
-    }
+fn create_compute(ctx: &GpuContext, buffers: &Buffers) -> Pipeline<wgpu::ComputePipeline> {
+    use wgpu::BufferBindingType::{Storage, Uniform};
+    let device = &ctx.device;
+    let cs = wgpu::ShaderStages::COMPUTE;
+    let module = shader(
+        device,
+        "sparse_life.wgsl",
+        &[&tiles::shader_constants(), LIFE_RULE_WGSL, include_str!("sparse_life.wgsl")],
+    );
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("sparse compute layout"),
+        entries: &[
+            layout_entry(0, cs, Uniform),
+            layout_entry(1, cs, Storage { read_only: true }),
+            layout_entry(2, cs, Storage { read_only: true }),
+            layout_entry(3, cs, Storage { read_only: true }),
+            layout_entry(4, cs, Storage { read_only: false }),
+            layout_entry(5, cs, Storage { read_only: false }),
+        ],
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("sparse step"),
+        layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sparse compute pipeline layout"),
+            bind_group_layouts: &[Some(&layout)],
+            ..Default::default()
+        })),
+        module: &module,
+        entry_point: Some("step"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let bind_groups = [0, 1].map(|i| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(&format!("sparse compute {i} -> {}", 1 - i)),
+            layout: &layout,
+            entries: &[
+                bind(0, &buffers.params),
+                bind(1, &buffers.active),
+                bind(2, &buffers.neighbors),
+                bind(3, &buffers.cells[i]),
+                bind(4, &buffers.cells[1 - i]),
+                bind(5, &buffers.flags),
+            ],
+        })
+    });
+    Pipeline { pipeline, bind_groups }
+}
 
-    /// Wait for a readback (normally already complete) and return its flags.
-    fn finish_readback(&self, readback: &PendingReadback) -> Vec<u32> {
-        // Wait for that submission only, not for everything queued since.
-        self.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(readback.submission.clone()),
-                timeout: None,
-            })
-            .expect("wait for tile flags");
-        let buffer = &self.flags_staging[readback.staging];
-        let bytes = (readback.coords.len() * 4) as u64;
-        let flags = {
-            let view = buffer.get_mapped_range(0..bytes).expect("mapped flags");
-            bytemuck::cast_slice::<u8, u32>(&view).to_vec()
-        };
-        buffer.unmap();
-        flags
-    }
-
-    /// Drop any in-flight readback (e.g. when the world is replaced).
-    fn discard_readback(&mut self) {
-        if let Some(pending) = self.pending.take() {
-            self.finish_readback(&pending);
-        }
-    }
+fn create_render(ctx: &GpuContext, buffers: &Buffers) -> Pipeline<wgpu::RenderPipeline> {
+    use wgpu::BufferBindingType::{Storage, Uniform};
+    let device = &ctx.device;
+    let fs = wgpu::ShaderStages::FRAGMENT;
+    let module = shader(
+        device,
+        "sparse_render.wgsl",
+        &[&tiles::shader_constants(), include_str!("sparse_render.wgsl")],
+    );
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("sparse render layout"),
+        entries: &[
+            layout_entry(0, fs, Uniform),
+            layout_entry(1, fs, Storage { read_only: true }),
+            layout_entry(2, fs, Storage { read_only: true }),
+        ],
+    });
+    let bind_groups = [0, 1].map(|i| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(&format!("sparse render {i}")),
+            layout: &layout,
+            entries: &[
+                bind(0, &buffers.view),
+                bind(1, &buffers.tile_map),
+                bind(2, &buffers.cells[i]),
+            ],
+        })
+    });
+    Pipeline { pipeline: fullscreen_pipeline(ctx, "sparse draw", &module, &layout), bind_groups }
 }
 
 impl Engine for SparseEngine {
@@ -362,19 +386,17 @@ impl Engine for SparseEngine {
         format!("ENGINE SPARSE: BIT-PACKED {TILE}X{TILE} TILES, UNBOUNDED")
     }
 
-    fn info(&self) -> String {
+    fn info(&self) -> Vec<String> {
         let used = self.world.len() as u64;
         let capacity = u64::from(self.world.capacity());
         let pct = 100.0 * used as f64 / capacity.max(1) as f64;
         // Both cell buffers count: each tile costs 2 x TILE_BYTES.
         let bytes = |tiles: u64| human((tiles * 2 * TILE_BYTES) as f64, BYTE_UNITS);
         let full = if self.world.overflowed { "  POOL FULL" } else { "" };
-        format!(
-            "TILES {used} OF {capacity}  {pct:.1}% USED{full}\n\
-             TILE MEMORY {} OF {}",
-            bytes(used),
-            bytes(capacity)
-        )
+        vec![
+            format!("TILES {used} OF {capacity}  {pct:.1}% USED{full}"),
+            format!("TILE MEMORY {} OF {}", bytes(used), bytes(capacity)),
+        ]
     }
 
     fn generation(&self) -> u64 {
@@ -390,9 +412,9 @@ impl Engine for SparseEngine {
     }
 
     fn load(&mut self, cells: &[(i32, i32)]) {
-        self.discard_readback();
+        self.readback.discard(&self.device);
         self.world.clear();
-        let mut tile_data: HashMap<tiles::TileCoord, Vec<u32>> = HashMap::new();
+        let mut tile_data: HashMap<TileCoord, Vec<u32>> = HashMap::new();
         for &(x, y) in cells {
             let (tile, i) = tiles::locate(x, y);
             tile_data.entry(tile).or_insert_with(|| vec![0; TILE_WORDS])[i / 32] |= 1 << (i % 32);
@@ -419,7 +441,7 @@ impl Engine for SparseEngine {
         self.apply_world_changes();
         for (slot, data) in &placed {
             self.queue.write_buffer(
-                &self.cell_buffers[self.current],
+                &self.buffers.cells[self.current_buffer],
                 u64::from(*slot) * TILE_BYTES,
                 bytemuck::cast_slice(data),
             );
@@ -475,15 +497,15 @@ impl Engine for SparseEngine {
             _pad: 0,
         };
         if self.last_view.as_ref() != Some(&(view, map.clone())) {
-            self.queue.write_buffer(&self.view_buffer, 0, bytemuck::bytes_of(&view));
-            self.queue.write_buffer(&self.tile_map_buffer, 0, bytemuck::cast_slice(&map));
+            self.queue.write_buffer(&self.buffers.view, 0, bytemuck::bytes_of(&view));
+            self.queue.write_buffer(&self.buffers.tile_map, 0, bytemuck::cast_slice(&map));
             self.last_view = Some((view, map));
         }
     }
 
     fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
-        pass.set_pipeline(&self.render_pipeline);
-        pass.set_bind_group(0, &self.render_bind_groups[self.current], &[]);
+        pass.set_pipeline(&self.render.pipeline);
+        pass.set_bind_group(0, &self.render.bind_groups[self.current_buffer], &[]);
         pass.draw(0..3, 0..1);
     }
 

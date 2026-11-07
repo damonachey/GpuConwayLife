@@ -1,8 +1,8 @@
 //! GPU Conway's Game of Life with two swappable engines.
 //!
 //! - **Dense** (`dense.rs`): one huge bit-packed grid with dead edges.
-//! - **Sparse** (`sparse.rs`): an unbounded world of 64x64 tiles that grows and
-//!   shrinks with the life in it.
+//! - **Sparse** (`sparse.rs`): an unbounded world of bit-packed tiles (size set by
+//!   `tiles::TILE`) that grows and shrinks with the life in it.
 //!
 //! This file holds what they share: the window, keyboard, speed control, stats and
 //! the text overlay. Pressing E drops the current engine (freeing its GPU memory),
@@ -53,8 +53,8 @@ enum Start {
     Pattern(&'static [&'static str]),
 }
 
-/// Simulation pacing controlled from the keyboard.
-struct Sim {
+/// Speed, pausing and single-stepping, controlled from the keyboard.
+struct Pacing {
     paused: bool,
     speed_level: i32,
     /// Fractional generations owed, for speeds below one per frame.
@@ -63,7 +63,7 @@ struct Sim {
     single_steps: u32,
 }
 
-impl Sim {
+impl Pacing {
     fn gens_per_frame(&self) -> f64 {
         2f64.powi(self.speed_level)
     }
@@ -122,11 +122,13 @@ struct App {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     ctx: GpuContext,
-    engine: Box<dyn Engine>,
+    /// Always present, except for the moment during an engine switch when the old
+    /// one has been dropped (to free its GPU memory) and the new one isn't built yet.
+    engine: Option<Box<dyn Engine>>,
     kind: EngineKind,
     start: Start,
     overlay: overlay::Overlay,
-    sim: Sim,
+    pacing: Pacing,
     stats: Stats,
 }
 
@@ -166,13 +168,21 @@ impl App {
             surface,
             config,
             ctx,
-            engine,
+            engine: Some(engine),
             kind,
             start: Start::Random,
             overlay,
-            sim: Sim { paused: false, speed_level: 0, pending: 0.0, single_steps: 0 },
+            pacing: Pacing { paused: false, speed_level: 0, pending: 0.0, single_steps: 0 },
             stats: Stats::new(),
         }
+    }
+
+    fn engine(&self) -> &dyn Engine {
+        self.engine.as_deref().expect("engine present outside a switch")
+    }
+
+    fn engine_mut(&mut self) -> &mut dyn Engine {
+        self.engine.as_deref_mut().expect("engine present outside a switch")
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -189,32 +199,32 @@ impl App {
         if event.state != ElementState::Pressed {
             return;
         }
+        let key = match &event.logical_key {
+            Key::Named(NamedKey::Space) => ' ',
+            Key::Character(text) => match text.chars().next() {
+                Some(c) => c.to_ascii_lowercase(),
+                None => return,
+            },
+            _ => return,
+        };
+        // Most keys act once per press; N and +/- also repeat while held.
         let fresh = !event.repeat;
-        match &event.logical_key {
-            Key::Named(NamedKey::Space) if fresh => {
-                self.sim.paused = !self.sim.paused;
-                self.sim.pending = 0.0;
+        let pacing = &mut self.pacing;
+        match key {
+            ' ' if fresh => {
+                pacing.paused = !pacing.paused;
+                pacing.pending = 0.0;
             }
-            // N may be held down to step repeatedly.
-            Key::Character(c) if c.eq_ignore_ascii_case("n") && self.sim.paused => {
-                self.sim.single_steps += 1;
-            }
-            Key::Character(c) if c.eq_ignore_ascii_case("e") && fresh => self.switch_engine(),
-            Key::Character(c) if c.eq_ignore_ascii_case("t") && fresh => self.engine.toggle_tiles(),
-            Key::Character(c) if c.eq_ignore_ascii_case("r") && fresh => self.restart(Start::Random),
-            Key::Character(c) if c == "1" && fresh => {
-                self.restart(Start::Pattern(patterns::GOSPER_GLIDER_GUN));
-            }
-            Key::Character(c) if c == "2" && fresh => self.restart(Start::Pattern(patterns::ACORN)),
-            Key::Character(c) if c == "3" && fresh => {
-                self.restart(Start::Pattern(patterns::BUNNIES));
-            }
-            Key::Character(c) if c == "4" && fresh => self.restart(Start::Pattern(patterns::ARK1)),
-            Key::Character(c) if c == "+" || c == "=" => {
-                self.sim.speed_level = (self.sim.speed_level + 1).min(MAX_SPEED_LEVEL);
-            }
-            Key::Character(c) if c == "-" || c == "_" => {
-                self.sim.speed_level = (self.sim.speed_level - 1).max(MIN_SPEED_LEVEL);
+            'n' if pacing.paused => pacing.single_steps += 1,
+            '+' | '=' => pacing.speed_level = (pacing.speed_level + 1).min(MAX_SPEED_LEVEL),
+            '-' | '_' => pacing.speed_level = (pacing.speed_level - 1).max(MIN_SPEED_LEVEL),
+            'e' if fresh => self.switch_engine(),
+            't' if fresh => self.engine_mut().toggle_tiles(),
+            'r' if fresh => self.restart(Start::Random),
+            c if fresh => {
+                if let Some(&(_, _, pattern)) = patterns::KEYED.iter().find(|(k, ..)| *k == c) {
+                    self.restart(Start::Pattern(pattern));
+                }
             }
             _ => {}
         }
@@ -224,10 +234,10 @@ impl App {
     fn restart(&mut self, start: Start) {
         self.start = start;
         match start {
-            Start::Random => self.engine.random(),
-            Start::Pattern(pattern) => self.engine.load(&patterns::centered(pattern)),
+            Start::Random => self.engine_mut().random(),
+            Start::Pattern(pattern) => self.engine_mut().load(&patterns::centered(pattern)),
         }
-        self.sim.pending = 0.0;
+        self.pacing.pending = 0.0;
     }
 
     /// Swap to the other engine and restart the current pattern in it.
@@ -237,12 +247,10 @@ impl App {
             EngineKind::Sparse => EngineKind::Dense,
         };
         log::info!("Switching engine: {:?} -> {next:?}", self.kind);
-        // Free the old engine's GPU memory before allocating the new one's: make the
-        // current engine a tiny placeholder, drop the real one, then build.
-        let old = std::mem::replace(&mut self.engine, Box::new(Placeholder));
-        drop(old);
+        // Free the old engine's GPU memory before allocating the new one's.
+        self.engine = None;
         let _ = self.ctx.device.poll(wgpu::PollType::wait_indefinitely());
-        self.engine = pollster::block_on(build_engine(&self.ctx, next));
+        self.engine = Some(pollster::block_on(build_engine(&self.ctx, next)));
         self.kind = next;
         // Speeds don't carry over meaningfully between engines.
         self.stats = Stats::new();
@@ -250,9 +258,9 @@ impl App {
     }
 
     fn overlay_text(&self) -> String {
-        let (sim, stats, engine) = (&self.sim, &self.stats, &self.engine);
+        let (pacing, stats, engine) = (&self.pacing, &self.stats, self.engine());
         let ms = if stats.fps > 0.0 { 1000.0 / stats.fps } else { 0.0 };
-        let state = if sim.paused { "  PAUSED" } else { "" };
+        let paused = if pacing.paused { "  PAUSED" } else { "" };
         let cell_rate = human(stats.gens_per_sec * engine.cells_per_generation() as f64, &[
             (1e12, "TRILLION"),
             (1e9, "BILLION"),
@@ -262,22 +270,24 @@ impl App {
             Some((cells, generation)) => format!("POP {cells} AT GEN {generation}"),
             None => "POP COUNTING".to_owned(),
         };
-        format!(
-            "{}\n\
-             {:.0} FPS  {ms:.2} MS\n\
-             GEN {}  {:.0} GEN/S  {cell_rate} CELLS/S\n\
-             {population}\n\
-             SPEED {} GEN/FRAME{state}\n\
-             {}\n\
-             SPACE PAUSE  N STEP  R RANDOM  +/- SPEED  E SWITCH ENGINE\n\
-             1 GUN  2 ACORN  3 BUNNIES  4 ARK1  T SHOW TILES",
+        let pattern_keys: Vec<String> =
+            patterns::KEYED.iter().map(|(key, label, _)| format!("{key} {label}")).collect();
+
+        let mut lines = vec![
             engine.title(),
-            stats.fps,
-            engine.generation(),
-            stats.gens_per_sec,
-            sim.speed_label(),
-            engine.info(),
-        )
+            format!("{:.0} FPS  {ms:.2} MS", stats.fps),
+            format!(
+                "GEN {}  {:.0} GEN/S  {cell_rate} CELLS/S",
+                engine.generation(),
+                stats.gens_per_sec
+            ),
+            population,
+            format!("SPEED {} GEN/FRAME{paused}", pacing.speed_label()),
+        ];
+        lines.extend(engine.info());
+        lines.push("SPACE PAUSE  N STEP  R RANDOM  +/- SPEED  E SWITCH ENGINE".to_owned());
+        lines.push(format!("{}  T SHOW TILES", pattern_keys.join("  ")));
+        lines.join("\n")
     }
 
     /// Advance the simulation as needed and draw a frame.
@@ -303,18 +313,20 @@ impl App {
         };
         let view = frame.texture.create_view(&Default::default());
 
-        let mut generations = self.sim.take_generations();
-        if !self.sim.paused {
+        let mut generations = self.pacing.take_generations();
+        if !self.pacing.paused {
             // Don't queue more than ~FRAME_BUDGET of GPU work, judged by recent
             // throughput; if the GPU can't keep up with the requested speed, drop
             // the excess rather than falling further behind.
             let budget = (self.stats.gens_per_sec * FRAME_BUDGET.as_secs_f64()).max(1.0) as u32;
             generations = generations.min(budget);
         }
-        self.engine.step(generations);
+        self.engine_mut().step(generations);
         self.stats.record(generations);
-        self.engine.update(self.config.width, self.config.height);
-        self.overlay.set_text(&self.overlay_text());
+        let (width, height) = (self.config.width, self.config.height);
+        self.engine_mut().update(width, height);
+        let text = self.overlay_text();
+        self.overlay.set_text(&text);
 
         let mut encoder = self.ctx.device.create_command_encoder(&Default::default());
         {
@@ -331,7 +343,7 @@ impl App {
                 })],
                 ..Default::default()
             });
-            self.engine.draw(&mut pass);
+            self.engine.as_deref().expect("engine present").draw(&mut pass);
             self.overlay.draw(&self.ctx.queue, &mut pass);
         }
 
@@ -390,38 +402,13 @@ async fn build_engine(ctx: &GpuContext, kind: EngineKind) -> Box<dyn Engine> {
     }
 }
 
-/// Stands in for an engine for the instant between dropping one and building the next.
-struct Placeholder;
-
-impl Engine for Placeholder {
-    fn title(&self) -> String {
-        String::new()
-    }
-    fn info(&self) -> String {
-        String::new()
-    }
-    fn generation(&self) -> u64 {
-        0
-    }
-    fn population(&self) -> Option<(u64, u64)> {
-        None
-    }
-    fn cells_per_generation(&self) -> u64 {
-        0
-    }
-    fn load(&mut self, _: &[(i32, i32)]) {}
-    fn random(&mut self) {}
-    fn step(&mut self, _: u32) {}
-    fn update(&mut self, _: u32, _: u32) {}
-    fn draw(&self, _: &mut wgpu::RenderPass<'_>) {}
-}
-
+/// Receives winit's events and creates the `App` once the window can exist.
 #[derive(Default)]
-struct Handler {
+struct WinitHandler {
     app: Option<App>,
 }
 
-impl ApplicationHandler for Handler {
+impl ApplicationHandler for WinitHandler {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.app.is_some() {
             return;
@@ -466,5 +453,5 @@ fn main() {
     }
     let event_loop = EventLoop::new().expect("create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
-    event_loop.run_app(&mut Handler::default()).expect("run event loop");
+    event_loop.run_app(&mut WinitHandler::default()).expect("run event loop");
 }

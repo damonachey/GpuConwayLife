@@ -65,6 +65,15 @@ pub const ARK1: &[&str] = &[
     "...OOOO.........................",
 ];
 
+/// The patterns on the number keys: (key, overlay label, pattern). Adding a row
+/// here adds the key and its help text.
+pub const KEYED: &[(char, &str, &[&str])] = &[
+    ('1', "GUN", GOSPER_GLIDER_GUN),
+    ('2', "ACORN", ACORN),
+    ('3', "BUNNIES", BUNNIES),
+    ('4', "ARK1", ARK1),
+];
+
 /// Live cells of `pattern` as (x, y) offsets centred on (0, 0).
 pub fn centered(pattern: &[&str]) -> Vec<(i32, i32)> {
     let h = pattern.len() as i32;

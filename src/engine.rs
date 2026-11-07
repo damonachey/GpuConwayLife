@@ -14,8 +14,8 @@ pub struct GpuContext {
 pub trait Engine {
     /// One overlay line naming the engine, e.g. "DENSE 16384X16384 ...".
     fn title(&self) -> String;
-    /// Engine-specific overlay lines (memory, tiles, ...), `\n`-separated.
-    fn info(&self) -> String;
+    /// Engine-specific overlay lines (memory, tiles, ...).
+    fn info(&self) -> Vec<String>;
     fn generation(&self) -> u64;
     /// Latest population measurement: (live cells, generation it was taken at).
     fn population(&self) -> Option<(u64, u64)>;
@@ -34,6 +34,47 @@ pub trait Engine {
     fn draw(&self, pass: &mut wgpu::RenderPass<'_>);
     /// Toggle the tile visualisation, for engines that have tiles.
     fn toggle_tiles(&mut self) {}
+}
+
+/// Conway's rule for 32 bit-packed cells, shared by both engines' compute shaders.
+pub const LIFE_RULE_WGSL: &str = include_str!("life_rule.wgsl");
+
+/// A shader module built from several WGSL sources joined in order (WGSL has no
+/// `#include`), e.g. shared constants and functions followed by the shader itself.
+pub fn shader(device: &wgpu::Device, label: &str, sources: &[&str]) -> wgpu::ShaderModule {
+    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(sources.concat().into()),
+    })
+}
+
+/// A buffer the CPU updates with `queue.write_buffer`, read as a uniform.
+pub fn uniform_buffer(device: &wgpu::Device, label: &str, size: u64) -> wgpu::Buffer {
+    buffer(device, label, size, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST)
+}
+
+/// A storage buffer, plus any `extra` usages (copy source/destination, ...).
+pub fn storage_buffer(
+    device: &wgpu::Device,
+    label: &str,
+    size: u64,
+    extra: wgpu::BufferUsages,
+) -> wgpu::Buffer {
+    buffer(device, label, size, wgpu::BufferUsages::STORAGE | extra)
+}
+
+/// A buffer the CPU maps to read GPU results back.
+pub fn readback_buffer(device: &wgpu::Device, label: &str, size: u64) -> wgpu::Buffer {
+    buffer(device, label, size, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST)
+}
+
+fn buffer(device: &wgpu::Device, label: &str, size: u64, usage: wgpu::BufferUsages) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size,
+        usage,
+        mapped_at_creation: false,
+    })
 }
 
 /// Shared helpers for building pipelines and bind groups.

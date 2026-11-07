@@ -7,18 +7,17 @@
 //
 // Each workgroup first copies its tile plus a one-word / one-row border (taken from
 // the neighbour tiles via the neighbour table; a missing neighbour (EMPTY) reads as
-// dead) into workgroup memory, then computes every word from there. The CPU
-// guarantees missing neighbours can't matter until its next bookkeeping pass (see
-// tiles.rs).
+// dead) into workgroup memory, then computes every word from there with
+// `next_word` (life_rule.wgsl). The CPU guarantees missing neighbours can't matter
+// until its next bookkeeping pass (see tiles.rs).
 //
 // Each workgroup also reports flags for its tile: bit 0 = any live cell, bit 1+d =
 // "a live cell is within MARGIN of the edge/corner toward neighbour d", and bits
-// 16.. = the tile's live-cell count (for the population readout).
+// POP_SHIFT.. = the tile's live-cell count (for the population readout).
 //
-// TILE and MARGIN must match tiles.rs.
+// TILE, MARGIN and POP_SHIFT are prepended by Rust from tiles.rs, along with
+// life_rule.wgsl.
 
-const TILE: u32 = 128u;
-const MARGIN: u32 = 64u;
 const WORDS_PER_ROW: u32 = TILE / 32u;
 const TILE_WORDS: u32 = TILE * WORDS_PER_ROW;
 // One thread per word, up to 256 (the most every wgpu device must allow).
@@ -53,6 +52,11 @@ fn dir_index(dx: i32, dy: i32) -> u32 {
     return select(k - 1u, k, k < 4u);
 }
 
+// Flag bit meaning "this tile needs its neighbour at offset (dx, dy)".
+fn need_bit(dx: i32, dy: i32) -> u32 {
+    return 2u << dir_index(dx, dy);
+}
+
 // Word at tile-local word column `wx` (-1..WORDS_PER_ROW) and row `y` (-1..TILE),
 // from this tile or a neighbour, straight from the pool.
 fn load_word(slot: u32, wx: i32, y: i32) -> u32 {
@@ -84,21 +88,26 @@ fn bits_in(wx: u32, lo: u32, hi: u32) -> u32 {
     return ones << (start - wx * 32u);
 }
 
-// Per-bit counter: s.x = ones, s.y = twos, s.z = "four or more" (sticky).
-// That's all Life needs: alive next iff count == 3, or count == 2 and alive now.
-fn add_bit(s: ptr<function, vec3<u32>>, x: u32) {
-    let c0 = (*s).x & x;
-    (*s).x ^= x;
-    let c1 = (*s).y & c0;
-    (*s).y ^= c0;
-    (*s).z |= c1;
+// Flags for a non-empty word `next` at word column `wx`, row `y`: the same as
+// `cell_flags` in tiles.rs, for all of the word's live cells at once. (MARGIN is a
+// multiple of 32, so a word is never near both the west and east edges.)
+fn word_flags(next: u32, wx: u32, y: u32) -> u32 {
+    let near_w = (next & bits_in(wx, 0u, MARGIN)) != 0u;
+    let near_e = (next & bits_in(wx, TILE - MARGIN, TILE)) != 0u;
+    let dx = select(select(0, 1, near_e), -1, near_w);
+    let dy = select(select(0, 1, y >= TILE - MARGIN), -1, y < MARGIN);
+    var f = 1u; // alive
+    if (dx != 0) { f |= need_bit(dx, 0); }
+    if (dy != 0) { f |= need_bit(0, dy); }
+    if (dx != 0 && dy != 0) { f |= need_bit(dx, dy); }
+    return f;
 }
 
 @compute @workgroup_size(THREADS)
 fn step(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(num_workgroups) nwg: vec3<u32>,
-    @builtin(local_invocation_index) lindex: u32,
+    @builtin(local_invocation_index) thread: u32,
 ) {
     // Tiles are spread over a 2D dispatch to stay under the 65535 per-axis limit.
     let index = wid.y * nwg.x + wid.x;
@@ -107,17 +116,17 @@ fn step(
     }
     let slot = active_tiles[index];
 
-    if (lindex == 0u) {
+    if (thread == 0u) {
         atomicStore(&tile_flags, 0u);
         atomicStore(&tile_pop, 0u);
     }
-    if (lindex < 8u) {
-        near_slots[lindex] = neighbors[slot * 8u + lindex];
+    if (thread < 8u) {
+        near_slots[thread] = neighbors[slot * 8u + thread];
     }
     workgroupBarrier();
 
     // Copy the tile and its border into workgroup memory.
-    for (var i = lindex; i < HALO_WORDS; i += THREADS) {
+    for (var i = thread; i < HALO_WORDS; i += THREADS) {
         let wx = i32(i % HALO_COLS) - 1;
         let y = i32(i / HALO_COLS) - 1;
         halo[i] = load_word(slot, wx, y);
@@ -126,51 +135,21 @@ fn step(
 
     var f = 0u;
     var pop = 0u;
-    for (var word = lindex; word < TILE_WORDS; word += THREADS) {
+    for (var word = thread; word < TILE_WORDS; word += THREADS) {
         let wx = word % WORDS_PER_ROW;
         let y = word / WORDS_PER_ROW;
         // Centre of this word in the halo; neighbours are +-1 column, +-HALO_COLS.
         let c = (y + 1u) * HALO_COLS + wx + 1u;
-        let ul = halo[c - HALO_COLS - 1u];
-        let u = halo[c - HALO_COLS];
-        let ur = halo[c - HALO_COLS + 1u];
-        let ml = halo[c - 1u];
-        let m = halo[c];
-        let mr = halo[c + 1u];
-        let dl = halo[c + HALO_COLS - 1u];
-        let d = halo[c + HALO_COLS];
-        let dr = halo[c + HALO_COLS + 1u];
-
-        // West neighbour of bit i is bit i-1 (from the left word at bit 0);
-        // east neighbour is bit i+1 (from the right word at bit 31).
-        var s = vec3<u32>(0u);
-        add_bit(&s, (u << 1u) | (ul >> 31u));
-        add_bit(&s, u);
-        add_bit(&s, (u >> 1u) | (ur << 31u));
-        add_bit(&s, (m << 1u) | (ml >> 31u));
-        add_bit(&s, (m >> 1u) | (mr << 31u));
-        add_bit(&s, (d << 1u) | (dl >> 31u));
-        add_bit(&s, d);
-        add_bit(&s, (d >> 1u) | (dr << 31u));
-        // count 2 -> (ones=0, twos=1), count 3 -> (ones=1, twos=1), and fewer than 4.
-        let next = s.y & ~s.z & (s.x | m);
+        let up = c - HALO_COLS;
+        let down = c + HALO_COLS;
+        let next = next_word(
+            halo[up - 1u], halo[up], halo[up + 1u],
+            halo[c - 1u], halo[c], halo[c + 1u],
+            halo[down - 1u], halo[down], halo[down + 1u],
+        );
         dst[slot * TILE_WORDS + word] = next;
-
         if (next != 0u) {
-            // Which edges / corners have a live cell within MARGIN of them.
-            let near_w = (next & bits_in(wx, 0u, MARGIN)) != 0u;
-            let near_e = (next & bits_in(wx, TILE - MARGIN, TILE)) != 0u;
-            let near_n = y < MARGIN;
-            let near_s = y >= TILE - MARGIN;
-            f |= 1u;
-            if (near_w) { f |= 2u << dir_index(-1, 0); }
-            if (near_e) { f |= 2u << dir_index(1, 0); }
-            if (near_n) { f |= 2u << dir_index(0, -1); }
-            if (near_s) { f |= 2u << dir_index(0, 1); }
-            if (near_w && near_n) { f |= 2u << dir_index(-1, -1); }
-            if (near_e && near_n) { f |= 2u << dir_index(1, -1); }
-            if (near_w && near_s) { f |= 2u << dir_index(-1, 1); }
-            if (near_e && near_s) { f |= 2u << dir_index(1, 1); }
+            f |= word_flags(next, wx, y);
             pop += countOneBits(next);
         }
     }
@@ -179,7 +158,7 @@ fn step(
         atomicAdd(&tile_pop, pop);
     }
     workgroupBarrier();
-    if (lindex == 0u) {
-        flags[index] = atomicLoad(&tile_flags) | (atomicLoad(&tile_pop) << 16u);
+    if (thread == 0u) {
+        flags[index] = atomicLoad(&tile_flags) | (atomicLoad(&tile_pop) << POP_SHIFT);
     }
 }

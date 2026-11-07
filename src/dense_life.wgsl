@@ -5,9 +5,8 @@
 // Each frame the compute pass reads `src` and writes the next generation to `dst`,
 // then the CPU swaps which buffer is which (ping-pong).
 //
-// One thread computes one whole word (32 cells) at once: it shifts the nine
-// surrounding words into eight "neighbour" words, then adds them with a bitwise
-// adder, so every bit position gets its own neighbour count in parallel.
+// One thread computes one whole word (32 cells) at once with `next_word` from
+// life_rule.wgsl, which Rust prepends to this file.
 
 struct Params {
     width: u32,         // cells per row (a multiple of 32)
@@ -19,16 +18,6 @@ struct Params {
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> src: array<u32>;
 @group(0) @binding(2) var<storage, read_write> dst: array<u32>;
-
-// Per-bit counter: s.x = ones, s.y = twos, s.z = "four or more" (sticky).
-// That's all Life needs: alive next iff count == 3, or count == 2 and alive now.
-fn add_bit(s: ptr<function, vec3<u32>>, x: u32) {
-    let c0 = (*s).x & x;
-    (*s).x ^= x;
-    let c1 = (*s).y & c0;
-    (*s).y ^= c0;
-    (*s).z |= c1;
-}
 
 @compute @workgroup_size(64, 4)
 fn step(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -64,20 +53,7 @@ fn step(@builtin(global_invocation_id) id: vec3<u32>) {
         if (has_r) { dr = src[rd + id.x + 1u]; }
     }
 
-    // West neighbour of bit i is bit i-1 (from the left word at bit 0);
-    // east neighbour is bit i+1 (from the right word at bit 31).
-    var s = vec3<u32>(0u);
-    add_bit(&s, (u << 1u) | (ul >> 31u));
-    add_bit(&s, u);
-    add_bit(&s, (u >> 1u) | (ur << 31u));
-    add_bit(&s, (m << 1u) | (ml >> 31u));
-    add_bit(&s, (m >> 1u) | (mr << 31u));
-    add_bit(&s, (d << 1u) | (dl >> 31u));
-    add_bit(&s, d);
-    add_bit(&s, (d >> 1u) | (dr << 31u));
-
-    // count 2 -> (ones=0, twos=1), count 3 -> (ones=1, twos=1), and fewer than 4.
-    dst[rm + id.x] = s.y & ~s.z & (s.x | m);
+    dst[rm + id.x] = next_word(ul, u, ur, ml, m, mr, dl, d, dr);
 }
 
 // Population count of `src`. Workgroup totals are spread over COUNTERS slots so no
@@ -90,9 +66,9 @@ var<workgroup> group_count: atomic<u32>;
 fn count(
     @builtin(global_invocation_id) id: vec3<u32>,
     @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_index) lindex: u32,
+    @builtin(local_invocation_index) thread: u32,
 ) {
-    if (lindex == 0u) {
+    if (thread == 0u) {
         atomicStore(&group_count, 0u);
     }
     workgroupBarrier();
@@ -103,7 +79,7 @@ fn count(
         }
     }
     workgroupBarrier();
-    if (lindex == 0u) {
+    if (thread == 0u) {
         atomicAdd(&counts[(wid.y * 7u + wid.x) % COUNTERS], atomicLoad(&group_count));
     }
 }

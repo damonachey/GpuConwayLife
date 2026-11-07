@@ -40,8 +40,9 @@ restarts whatever was last loaded (random soup or a pattern).
   wherever life is within 64 cells of an edge, and frees empty tiles. Readbacks
   are **pipelined** (applied one pass late, from double-buffered staging), so
   the GPU never waits on the CPU; the 64-cell margin covers the extra delay.
-- Tile size and margin are constants (`TILE`, `MARGIN` in `src/tiles.rs` and the
-  two sparse shaders). Measured trade-off: 128×128 tiles with a 64-cell margin
+- Tile size and margin are set once, as `TILE` and `MARGIN` in `src/tiles.rs`;
+  Rust prepends them to the sparse shaders, and compile-time checks reject
+  values the shaders can't handle. Measured trade-off: 128×128 tiles with a 64-cell margin
   are fastest for small patterns; a 32-cell margin is ~5–15% faster on big
   soups; 64×64 tiles are best for many tiny scattered objects (glider streams).
 - Random soup is a 1000×1000 square at the origin. **T** shades the allocated

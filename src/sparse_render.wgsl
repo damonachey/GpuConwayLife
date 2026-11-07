@@ -2,10 +2,10 @@
 // One full-screen triangle; each pixel finds its tile through a small map of the
 // tiles currently on screen (built by the CPU), then reads the cell's bit from the
 // pool (TILE rows of TILE / 32 words per tile; bit i of word wx is cell
-// x = wx * 32 + i). TILE must match tiles.rs.
+// x = wx * 32 + i).
+//
+// TILE and TILE_SHIFT (log2 of TILE) are prepended by Rust from tiles.rs.
 
-const TILE_SHIFT: u32 = 7u; // TILE = 128
-const TILE: u32 = 1u << TILE_SHIFT;
 const WORDS_PER_ROW: u32 = TILE / 32u;
 const TILE_WORDS: u32 = TILE * WORDS_PER_ROW;
 const EMPTY: u32 = 0xffffffffu;
