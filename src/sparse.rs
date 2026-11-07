@@ -8,14 +8,14 @@
 
 use std::collections::HashMap;
 
-use crate::engine::{Engine, GpuContext, bind, fullscreen_pipeline, layout_entry};
+use crate::engine::{BYTE_UNITS, Engine, GpuContext, bind, fullscreen_pipeline, human, layout_entry};
 use crate::patterns;
-use crate::tiles::{self, MARGIN, TILE, TILE_CELLS, TileWorld};
+use crate::tiles::{self, MARGIN, TILE, TILE_CELLS, TILE_WORDS, TileWorld};
 
-/// Bytes for one tile in one cell buffer (one u32 per cell).
-const TILE_BYTES: u64 = (TILE_CELLS * 4) as u64;
+/// Bytes for one tile in one cell buffer (bit-packed: 128 words = 512 bytes).
+const TILE_BYTES: u64 = (TILE_WORDS * 4) as u64;
 /// Upper bound on each of the two cell buffers. The real pool may be smaller if the
-/// GPU's buffer limits are lower. 512 MiB = 32768 tiles = ~134M cells.
+/// GPU's buffer limits are lower. 512 MiB = 1,048,576 tiles = ~4.3 billion cells.
 const POOL_BUDGET_BYTES: u64 = 512 << 20;
 /// Largest tile map the renderer supports (covers 16384 x 16384 pixels).
 const MAX_VIEW_TILES: u32 = 256;
@@ -291,7 +291,7 @@ impl SparseEngine {
 
 impl Engine for SparseEngine {
     fn title(&self) -> String {
-        "ENGINE SPARSE: 64X64 TILES, UNBOUNDED".to_owned()
+        "ENGINE SPARSE: BIT-PACKED 64X64 TILES, UNBOUNDED".to_owned()
     }
 
     fn info(&self) -> String {
@@ -299,13 +299,13 @@ impl Engine for SparseEngine {
         let capacity = u64::from(self.world.capacity());
         let pct = 100.0 * used as f64 / capacity.max(1) as f64;
         // Both cell buffers count: each tile costs 2 x TILE_BYTES.
-        let mib = |tiles: u64| (tiles * 2 * TILE_BYTES) as f64 / f64::from(1 << 20);
+        let bytes = |tiles: u64| human((tiles * 2 * TILE_BYTES) as f64, BYTE_UNITS);
         let full = if self.world.overflowed { "  POOL FULL" } else { "" };
         format!(
             "TILES {used} OF {capacity}  {pct:.1}% USED{full}\n\
-             TILE MEMORY {:.1} OF {:.0} MB",
-            mib(used),
-            mib(capacity)
+             TILE MEMORY {} OF {}",
+            bytes(used),
+            bytes(capacity)
         )
     }
 
@@ -326,7 +326,7 @@ impl Engine for SparseEngine {
         let mut tile_data: HashMap<tiles::TileCoord, Vec<u32>> = HashMap::new();
         for &(x, y) in cells {
             let (tile, i) = tiles::locate(x, y);
-            tile_data.entry(tile).or_insert_with(|| vec![0; TILE_CELLS])[i] = 1;
+            tile_data.entry(tile).or_insert_with(|| vec![0; TILE_WORDS])[i / 32] |= 1 << (i % 32);
         }
         let mut placed = Vec::new();
         for (tile, data) in tile_data {

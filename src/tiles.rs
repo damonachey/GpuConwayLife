@@ -17,6 +17,9 @@ use std::collections::{HashMap, HashSet};
 /// Tile edge length in cells.
 pub const TILE: u32 = 64;
 pub const TILE_CELLS: usize = (TILE * TILE) as usize;
+/// Cells are bit-packed: a tile is 64 rows of 2 `u32` words. Cell index
+/// `y * 64 + x` (see [`locate`]) lives in word `index / 32`, bit `index % 32`.
+pub const TILE_WORDS: usize = TILE_CELLS / 32;
 /// Distance from a tile edge that counts as "near" it, and therefore the number of
 /// generations that may run between bookkeeping passes. Must be <= TILE / 2.
 pub const MARGIN: u32 = 16;
@@ -39,16 +42,19 @@ pub fn dir_index(dx: i32, dy: i32) -> usize {
     if k < 4 { k } else { k - 1 }
 }
 
-/// Flags for one tile's cells: [`ALIVE`], a bit per neighbour it needs, and the
-/// live-cell count in bits [`POP_SHIFT`]...
-/// Mirrors the logic in `life.wgsl`, for patterns placed from the CPU.
-pub fn flags_for(cells: &[u32]) -> u32 {
+/// Flags for one tile's bit-packed words ([`TILE_WORDS`] of them): [`ALIVE`], a bit
+/// per neighbour it needs, and the live-cell count in bits [`POP_SHIFT`]...
+/// Mirrors the logic in `sparse_life.wgsl`, for patterns placed from the CPU.
+pub fn flags_for(words: &[u32]) -> u32 {
     let mut flags = 0;
     let mut pop = 0;
-    for (i, &alive) in cells.iter().enumerate() {
-        if alive != 0 {
-            flags |= cell_flags(i as u32 % TILE, i as u32 / TILE);
+    for (w, &word) in words.iter().enumerate() {
+        let mut bits = word;
+        while bits != 0 {
+            let i = w as u32 * 32 + bits.trailing_zeros();
+            flags |= cell_flags(i % TILE, i / TILE);
             pop += 1;
+            bits &= bits - 1;
         }
     }
     flags | pop << POP_SHIFT
@@ -272,6 +278,26 @@ mod tests {
             se,
             ALIVE | 2 << dir_index(1, 0) | 2 << dir_index(0, 1) | 2 << dir_index(1, 1)
         );
+    }
+
+    #[test]
+    fn flags_for_reads_packed_bits() {
+        let mut words = vec![0u32; TILE_WORDS];
+        let mut set = |x: i32, y: i32| {
+            let (_, i) = locate(x, y);
+            words[i / 32] |= 1 << (i % 32);
+        };
+        set(32, 32); // centre: alive only
+        set(0, 32); // west edge
+        set(63, 63); // south-east corner
+        let f = flags_for(&words);
+        assert_eq!(f >> POP_SHIFT, 3);
+        let expected = ALIVE
+            | 2 << dir_index(-1, 0)
+            | 2 << dir_index(1, 0)
+            | 2 << dir_index(0, 1)
+            | 2 << dir_index(1, 1);
+        assert_eq!(f & ((1 << POP_SHIFT) - 1), expected);
     }
 
     #[test]

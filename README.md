@@ -27,10 +27,13 @@ restarts whatever was last loaded (random soup or a pattern).
 ## Sparse engine (`src/sparse.rs`, `src/tiles.rs`)
 
 - The world is **unbounded**: it's cut into 64×64 tiles, and only tiles near
-  live cells exist, in a GPU pool of up to 32,768 tiles (2 × 512 MiB).
-- The compute shader (`src/sparse_life.wgsl`) steps one tile per workgroup,
-  reading across tile edges through a per-tile neighbour table, and reports per
-  tile whether it's alive, which neighbours it needs, and its population.
+  live cells exist. Tiles are **bit-packed** (64 rows × 2 words = 512 bytes), so
+  the GPU pool holds up to **1,048,576 tiles ≈ 4.3 billion cells** (2 × 512 MiB).
+- The compute shader (`src/sparse_life.wgsl`) steps one tile per 128-thread
+  workgroup, one thread per word, with the same bitwise adder as the dense
+  engine. Words beyond a tile's edge come from neighbour tiles via a per-tile
+  neighbour table. It also reports per tile whether it's alive, which neighbours
+  it needs, and its population.
 - Life spreads at most one cell per generation, so the CPU only looks every
   **16 generations**: it reads back 4 bytes per tile, allocates neighbours
   wherever life is within 16 cells of an edge, and frees empty tiles.
