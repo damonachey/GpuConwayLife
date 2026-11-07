@@ -210,6 +210,11 @@ impl SparseEngine {
         }
     }
 
+    /// Number of allocated tiles.
+    pub fn tile_count(&self) -> usize {
+        self.world.len()
+    }
+
     /// Upload the tile world's pending changes to the GPU.
     fn apply_world_changes(&mut self) {
         let changes = self.world.take_changes();

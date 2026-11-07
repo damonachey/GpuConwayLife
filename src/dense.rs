@@ -119,13 +119,17 @@ pub struct DenseEngine {
 }
 
 impl DenseEngine {
+    /// Grid side from LIFE_GRID=<side> if set, else DEFAULT_GRID_SIDE.
     pub async fn new(ctx: &GpuContext) -> Self {
-        let device = &ctx.device;
-
-        // Grid size: LIFE_GRID=<side> if set, else DEFAULT_GRID_SIDE; either way no
-        // bigger than the GPU's limits allow.
         let requested = std::env::var("LIFE_GRID").ok().and_then(|s| s.trim().parse::<u32>().ok());
-        let mut grid = Grid::square(requested.unwrap_or(DEFAULT_GRID_SIDE));
+        Self::with_side(ctx, requested.unwrap_or(DEFAULT_GRID_SIDE)).await
+    }
+
+    /// A square grid of about `side` cells (a multiple of 32, no bigger than the
+    /// GPU's limits allow).
+    pub async fn with_side(ctx: &GpuContext, side: u32) -> Self {
+        let device = &ctx.device;
+        let mut grid = Grid::square(side);
         if grid.bytes() > ctx.max_buffer {
             log::warn!("{0}x{0} grid is too big for this GPU; shrinking", grid.width);
             grid = Grid::square_fitting(ctx.max_buffer);

@@ -11,6 +11,7 @@
 //! Controls: Space pause/resume, N step (while paused), R random soup, 1 glider gun,
 //! 2 acorn, 3 bunnies, 4 Ark1, E switch engine, T show tiles (sparse), +/- speed.
 
+mod bench;
 mod dense;
 mod engine;
 mod overlay;
@@ -144,27 +145,7 @@ impl App {
             .await
             .expect("no suitable GPU adapter");
         log::info!("Using adapter: {:?}", adapter.get_info());
-
-        // Ask for the biggest buffers the GPU supports (wgpu defaults to 128 MiB).
-        let adapter_limits = adapter.limits();
-        let max_buffer = MAX_BUFFER_BYTES
-            .min(adapter_limits.max_storage_buffer_binding_size)
-            .min(adapter_limits.max_buffer_size);
-        let defaults = wgpu::Limits::default();
-        let required_limits = wgpu::Limits {
-            max_storage_buffer_binding_size: max_buffer
-                .max(defaults.max_storage_buffer_binding_size),
-            max_buffer_size: max_buffer.max(defaults.max_buffer_size),
-            ..defaults
-        };
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("life device"),
-                required_limits,
-                ..Default::default()
-            })
-            .await
-            .expect("request device");
+        let (device, queue, max_buffer) = create_device(&adapter).await;
 
         let size = window.inner_size();
         let config = surface
@@ -360,6 +341,48 @@ impl App {
     }
 }
 
+/// Create the device, asking for the biggest buffers the GPU supports (wgpu
+/// defaults to 128 MiB). Returns the device, queue and usable max buffer size.
+async fn create_device(adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::Queue, u64) {
+    let adapter_limits = adapter.limits();
+    let max_buffer = MAX_BUFFER_BYTES
+        .min(adapter_limits.max_storage_buffer_binding_size)
+        .min(adapter_limits.max_buffer_size);
+    let defaults = wgpu::Limits::default();
+    let required_limits = wgpu::Limits {
+        max_storage_buffer_binding_size: max_buffer.max(defaults.max_storage_buffer_binding_size),
+        max_buffer_size: max_buffer.max(defaults.max_buffer_size),
+        ..defaults
+    };
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("life device"),
+            required_limits,
+            ..Default::default()
+        })
+        .await
+        .expect("request device");
+    (device, queue, max_buffer)
+}
+
+/// `--bench`: run the headless benchmark instead of opening a window.
+fn run_bench() {
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        ..Default::default()
+    }))
+    .expect("no suitable GPU adapter");
+    let info = adapter.get_info();
+    println!("Adapter: {} ({:?})", info.name, info.backend);
+    let (device, queue, max_buffer) = pollster::block_on(create_device(&adapter));
+    // Any render format works; nothing is presented.
+    let ctx =
+        GpuContext { device, queue, format: wgpu::TextureFormat::Bgra8UnormSrgb, max_buffer };
+    bench::run(&ctx);
+}
+
 async fn build_engine(ctx: &GpuContext, kind: EngineKind) -> Box<dyn Engine> {
     match kind {
         EngineKind::Dense => Box::new(dense::DenseEngine::new(ctx).await),
@@ -437,6 +460,10 @@ fn main() {
             .default_filter_or("warn,gpu_conway_life=info,wgpu_hal::vulkan::instance=off"),
     )
     .init();
+    if std::env::args().any(|a| a == "--bench") {
+        run_bench();
+        return;
+    }
     let event_loop = EventLoop::new().expect("create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
     event_loop.run_app(&mut Handler::default()).expect("run event loop");
