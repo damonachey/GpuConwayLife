@@ -1,22 +1,26 @@
 // Conway's Game of Life on a sparse, tiled world, entirely on the GPU.
 //
-// The world is made of 64x64 tiles stored in a pool (`src` / `dst`, ping-ponged
-// each generation). Cells are bit-packed: a tile is 64 rows of 2 u32 words, and bit
-// i of word wx in row y is tile-local cell (wx * 32 + i, y). One 128-thread
-// workgroup processes one active tile, one thread per word.
+// The world is made of TILE x TILE tiles stored in a pool (`src` / `dst`,
+// ping-ponged each generation). Cells are bit-packed: a tile is TILE rows of
+// WORDS_PER_ROW u32 words, and bit i of word wx in row y is tile-local cell
+// (wx * 32 + i, y). One workgroup processes one active tile; each thread computes
+// TILE_WORDS / THREADS words.
 //
 // Words outside a tile are read through that tile's neighbour table; a missing
-// neighbour (EMPTY) counts as dead. The CPU guarantees that can't matter for the
-// next MARGIN generations (see tiles.rs).
+// neighbour (EMPTY) counts as dead. The CPU guarantees that can't matter until its
+// next bookkeeping pass (see tiles.rs).
 //
 // Each workgroup also reports flags for its tile: bit 0 = any live cell, bit 1+d =
 // "a live cell is within MARGIN of the edge/corner toward neighbour d", and bits
-// 16..28 = the tile's live-cell count (for the population readout).
+// 16.. = the tile's live-cell count (for the population readout).
+//
+// TILE and MARGIN must match tiles.rs.
 
-const TILE: u32 = 64u;
-const WORDS_PER_ROW: u32 = 2u;
-const TILE_WORDS: u32 = 128u;
-const MARGIN: u32 = 32u;
+const TILE: u32 = 128u;
+const MARGIN: u32 = 64u;
+const WORDS_PER_ROW: u32 = TILE / 32u;
+const TILE_WORDS: u32 = TILE * WORDS_PER_ROW;
+const THREADS: u32 = 256u;
 const EMPTY: u32 = 0xffffffffu;
 
 struct Params {
@@ -39,8 +43,9 @@ fn dir_index(dx: i32, dy: i32) -> u32 {
     return select(k - 1u, k, k < 4u);
 }
 
-// Word at tile-local word column `wx` (-1..2) and row `y` (-1..64): may be one word
-// or one row outside the tile, in which case it comes from a neighbour tile.
+// Word at tile-local word column `wx` (-1..WORDS_PER_ROW) and row `y` (-1..TILE):
+// may be one word or one row outside the tile, in which case it comes from a
+// neighbour tile.
 fn read_word(slot: u32, wx: i32, y: i32) -> u32 {
     let wpr = i32(WORDS_PER_ROW);
     let t = i32(TILE);
@@ -58,6 +63,18 @@ fn read_word(slot: u32, wx: i32, y: i32) -> u32 {
     return src[s * TILE_WORDS + ly * WORDS_PER_ROW + lx];
 }
 
+// Bits of word column `wx` whose cells lie in x = [lo, hi).
+fn bits_in(wx: u32, lo: u32, hi: u32) -> u32 {
+    let start = max(lo, wx * 32u);
+    let end = min(hi, wx * 32u + 32u);
+    if (start >= end) {
+        return 0u;
+    }
+    let n = end - start;
+    let ones = select((1u << n) - 1u, 0xffffffffu, n == 32u);
+    return ones << (start - wx * 32u);
+}
+
 // Per-bit counter: s.x = ones, s.y = twos, s.z = "four or more" (sticky).
 // That's all Life needs: alive next iff count == 3, or count == 2 and alive now.
 fn add_bit(s: ptr<function, vec3<u32>>, x: u32) {
@@ -68,7 +85,7 @@ fn add_bit(s: ptr<function, vec3<u32>>, x: u32) {
     (*s).z |= c1;
 }
 
-@compute @workgroup_size(128)
+@compute @workgroup_size(256)
 fn step(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(num_workgroups) nwg: vec3<u32>,
@@ -87,52 +104,57 @@ fn step(
     }
     workgroupBarrier();
 
-    let wx = i32(lindex % WORDS_PER_ROW);
-    let y = i32(lindex / WORDS_PER_ROW);
-    let ul = read_word(slot, wx - 1, y - 1);
-    let u = read_word(slot, wx, y - 1);
-    let ur = read_word(slot, wx + 1, y - 1);
-    let ml = read_word(slot, wx - 1, y);
-    let m = src[slot * TILE_WORDS + lindex];
-    let mr = read_word(slot, wx + 1, y);
-    let dl = read_word(slot, wx - 1, y + 1);
-    let d = read_word(slot, wx, y + 1);
-    let dr = read_word(slot, wx + 1, y + 1);
+    var f = 0u;
+    var pop = 0u;
+    for (var word = lindex; word < TILE_WORDS; word += THREADS) {
+        let wx = i32(word % WORDS_PER_ROW);
+        let y = i32(word / WORDS_PER_ROW);
+        let ul = read_word(slot, wx - 1, y - 1);
+        let u = read_word(slot, wx, y - 1);
+        let ur = read_word(slot, wx + 1, y - 1);
+        let ml = read_word(slot, wx - 1, y);
+        let m = src[slot * TILE_WORDS + word];
+        let mr = read_word(slot, wx + 1, y);
+        let dl = read_word(slot, wx - 1, y + 1);
+        let d = read_word(slot, wx, y + 1);
+        let dr = read_word(slot, wx + 1, y + 1);
 
-    // West neighbour of bit i is bit i-1 (from the left word at bit 0);
-    // east neighbour is bit i+1 (from the right word at bit 31).
-    var s = vec3<u32>(0u);
-    add_bit(&s, (u << 1u) | (ul >> 31u));
-    add_bit(&s, u);
-    add_bit(&s, (u >> 1u) | (ur << 31u));
-    add_bit(&s, (m << 1u) | (ml >> 31u));
-    add_bit(&s, (m >> 1u) | (mr << 31u));
-    add_bit(&s, (d << 1u) | (dl >> 31u));
-    add_bit(&s, d);
-    add_bit(&s, (d >> 1u) | (dr << 31u));
-    // count 2 -> (ones=0, twos=1), count 3 -> (ones=1, twos=1), and fewer than 4.
-    let next = s.y & ~s.z & (s.x | m);
-    dst[slot * TILE_WORDS + lindex] = next;
+        // West neighbour of bit i is bit i-1 (from the left word at bit 0);
+        // east neighbour is bit i+1 (from the right word at bit 31).
+        var s = vec3<u32>(0u);
+        add_bit(&s, (u << 1u) | (ul >> 31u));
+        add_bit(&s, u);
+        add_bit(&s, (u >> 1u) | (ur << 31u));
+        add_bit(&s, (m << 1u) | (ml >> 31u));
+        add_bit(&s, (m >> 1u) | (mr << 31u));
+        add_bit(&s, (d << 1u) | (dl >> 31u));
+        add_bit(&s, d);
+        add_bit(&s, (d >> 1u) | (dr << 31u));
+        // count 2 -> (ones=0, twos=1), count 3 -> (ones=1, twos=1), and fewer than 4.
+        let next = s.y & ~s.z & (s.x | m);
+        dst[slot * TILE_WORDS + word] = next;
 
-    if (next != 0u) {
-        // Which edges / corners have a live cell within MARGIN of them. Word 0
-        // holds x = 0..31 (west margin = bits 0..15); word 1 holds x = 32..63
-        // (east margin = bits 16..31). All bits share row y.
-        let near_w = wx == 0 && (next & 0xffffu) != 0u;
-        let near_e = wx == 1 && (next & 0xffff0000u) != 0u;
-        let near_n = u32(y) < MARGIN;
-        let near_s = u32(y) >= TILE - MARGIN;
-        var f = 1u;
-        if (near_w) { f |= 2u << dir_index(-1, 0); }
-        if (near_e) { f |= 2u << dir_index(1, 0); }
-        if (near_n) { f |= 2u << dir_index(0, -1); }
-        if (near_s) { f |= 2u << dir_index(0, 1); }
-        if (near_w && near_n) { f |= 2u << dir_index(-1, -1); }
-        if (near_e && near_n) { f |= 2u << dir_index(1, -1); }
-        if (near_w && near_s) { f |= 2u << dir_index(-1, 1); }
-        if (near_e && near_s) { f |= 2u << dir_index(1, 1); }
+        if (next != 0u) {
+            // Which edges / corners have a live cell within MARGIN of them.
+            let near_w = (next & bits_in(u32(wx), 0u, MARGIN)) != 0u;
+            let near_e = (next & bits_in(u32(wx), TILE - MARGIN, TILE)) != 0u;
+            let near_n = u32(y) < MARGIN;
+            let near_s = u32(y) >= TILE - MARGIN;
+            f |= 1u;
+            if (near_w) { f |= 2u << dir_index(-1, 0); }
+            if (near_e) { f |= 2u << dir_index(1, 0); }
+            if (near_n) { f |= 2u << dir_index(0, -1); }
+            if (near_s) { f |= 2u << dir_index(0, 1); }
+            if (near_w && near_n) { f |= 2u << dir_index(-1, -1); }
+            if (near_e && near_n) { f |= 2u << dir_index(1, -1); }
+            if (near_w && near_s) { f |= 2u << dir_index(-1, 1); }
+            if (near_e && near_s) { f |= 2u << dir_index(1, 1); }
+            pop += countOneBits(next);
+        }
+    }
+    if (f != 0u) {
         atomicOr(&tile_flags, f);
-        atomicAdd(&tile_pop, countOneBits(next));
+        atomicAdd(&tile_pop, pop);
     }
     workgroupBarrier();
     if (lindex == 0u) {

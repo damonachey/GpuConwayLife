@@ -1,4 +1,4 @@
-//! Sparse engine: an effectively unbounded world made of 64x64 tiles.
+//! Sparse engine: an effectively unbounded world made of TILE x TILE tiles.
 //!
 //! Tiles live in a fixed GPU pool. `sparse_life.wgsl` steps every active tile and
 //! reports which tiles are alive and which neighbours they need; every
@@ -12,12 +12,12 @@ use crate::engine::{BYTE_UNITS, Engine, GpuContext, bind, fullscreen_pipeline, h
 use crate::patterns;
 use crate::tiles::{self, BOOKKEEPING_INTERVAL, TILE, TILE_CELLS, TILE_WORDS, TileCoord, TileWorld};
 
-/// Bytes for one tile in one cell buffer (bit-packed: 128 words = 512 bytes).
+/// Bytes for one tile in one cell buffer (bit-packed, one bit per cell).
 const TILE_BYTES: u64 = (TILE_WORDS * 4) as u64;
 /// Upper bound on each of the two cell buffers. The real pool may be smaller if the
-/// GPU's buffer limits are lower. 512 MiB = 1,048,576 tiles = ~4.3 billion cells.
+/// GPU's buffer limits are lower. 512 MiB of bits = ~4.3 billion cells.
 const POOL_BUDGET_BYTES: u64 = 512 << 20;
-/// Largest tile map the renderer supports (covers 16384 x 16384 pixels).
+/// Largest tile map the renderer supports, in tiles per side.
 const MAX_VIEW_TILES: u32 = 256;
 /// Side length of the random soup square.
 const RANDOM_SIZE: i32 = 1000;
@@ -349,7 +349,7 @@ impl SparseEngine {
 
 impl Engine for SparseEngine {
     fn title(&self) -> String {
-        "ENGINE SPARSE: BIT-PACKED 64X64 TILES, UNBOUNDED".to_owned()
+        format!("ENGINE SPARSE: BIT-PACKED {TILE}X{TILE} TILES, UNBOUNDED")
     }
 
     fn info(&self) -> String {

@@ -21,14 +21,14 @@
 use std::collections::{HashMap, HashSet};
 
 /// Tile edge length in cells.
-pub const TILE: u32 = 64;
+pub const TILE: u32 = 128;
 pub const TILE_CELLS: usize = (TILE * TILE) as usize;
-/// Cells are bit-packed: a tile is 64 rows of 2 `u32` words. Cell index
-/// `y * 64 + x` (see [`locate`]) lives in word `index / 32`, bit `index % 32`.
+/// Cells are bit-packed: a tile is TILE rows of TILE / 32 `u32` words. Cell index
+/// `y * TILE + x` (see [`locate`]) lives in word `index / 32`, bit `index % 32`.
 pub const TILE_WORDS: usize = TILE_CELLS / 32;
 /// Distance from a tile edge that counts as "near" it. Must be <= TILE / 2, and
-/// must match MARGIN in sparse_life.wgsl.
-pub const MARGIN: u32 = 32;
+/// must match MARGIN in sparse_life.wgsl. (TILE must match both shaders too.)
+pub const MARGIN: u32 = 64;
 /// Generations between bookkeeping passes. Readbacks are applied one pass late, so
 /// this must be at most MARGIN / 2.
 pub const BOOKKEEPING_INTERVAL: u32 = MARGIN / 2;
@@ -286,8 +286,10 @@ mod tests {
     fn locate_handles_negative_coordinates() {
         assert_eq!(locate(0, 0), ((0, 0), 0));
         assert_eq!(locate(-1, -1), ((-1, -1), TILE_CELLS - 1));
-        assert_eq!(locate(64, 1), ((1, 0), 64));
-        assert_eq!(locate(-64, 0), ((-1, 0), 0));
+        let t = TILE as i32;
+        assert_eq!(locate(t, 1), ((1, 0), TILE as usize));
+        assert_eq!(locate(-t, 0), ((-1, 0), 0));
+        assert_eq!(locate(-1, 0), ((-1, 0), TILE as usize - 1));
     }
 
     #[test]

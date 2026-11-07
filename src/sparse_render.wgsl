@@ -1,9 +1,13 @@
 // Draws the tiled world at native resolution: one cell = one screen pixel.
 // One full-screen triangle; each pixel finds its tile through a small map of the
 // tiles currently on screen (built by the CPU), then reads the cell's bit from the
-// pool (64 rows of 2 words per tile; bit i of word wx is cell x = wx * 32 + i).
+// pool (TILE rows of TILE / 32 words per tile; bit i of word wx is cell
+// x = wx * 32 + i). TILE must match tiles.rs.
 
-const TILE_WORDS: u32 = 128u;
+const TILE_SHIFT: u32 = 7u; // TILE = 128
+const TILE: u32 = 1u << TILE_SHIFT;
+const WORDS_PER_ROW: u32 = TILE / 32u;
+const TILE_WORDS: u32 = TILE * WORDS_PER_ROW;
 const EMPTY: u32 = 0xffffffffu;
 
 struct View {
@@ -33,8 +37,8 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let live_color = vec3<f32>(0.35, 0.95, 0.55);
 
     let world = vec2<i32>(floor(frag.xy)) + view.screen_origin;
-    let tile = world >> vec2<u32>(6u);            // floor division by 64
-    let local = vec2<u32>(world & vec2<i32>(63)); // always 0..63
+    let tile = world >> vec2<u32>(TILE_SHIFT);                // floor division by TILE
+    let local = vec2<u32>(world & vec2<i32>(i32(TILE) - 1));  // always 0..TILE-1
     let m = tile - view.map_origin;
     if (m.x < 0 || m.y < 0 || u32(m.x) >= view.map_size.x || u32(m.y) >= view.map_size.y) {
         return vec4<f32>(dead_color, 1.0);
@@ -43,7 +47,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     if (slot == EMPTY) {
         return vec4<f32>(dead_color, 1.0);
     }
-    let word = cells[slot * TILE_WORDS + local.y * 2u + (local.x >> 5u)];
+    let word = cells[slot * TILE_WORDS + local.y * WORDS_PER_ROW + (local.x >> 5u)];
     if (((word >> (local.x & 31u)) & 1u) == 1u) {
         return vec4<f32>(live_color, 1.0);
     }

@@ -26,19 +26,23 @@ restarts whatever was last loaded (random soup or a pattern).
 
 ## Sparse engine (`src/sparse.rs`, `src/tiles.rs`)
 
-- The world is **unbounded**: it's cut into 64×64 tiles, and only tiles near
-  live cells exist. Tiles are **bit-packed** (64 rows × 2 words = 512 bytes), so
-  the GPU pool holds up to **1,048,576 tiles ≈ 4.3 billion cells** (2 × 512 MiB).
-- The compute shader (`src/sparse_life.wgsl`) steps one tile per 128-thread
-  workgroup, one thread per word, with the same bitwise adder as the dense
+- The world is **unbounded**: it's cut into 128×128 tiles, and only tiles near
+  live cells exist. Tiles are **bit-packed** (128 rows × 4 words = 2 KB), so the
+  GPU pool holds up to **262,144 tiles ≈ 4.3 billion cells** (2 × 512 MiB).
+- The compute shader (`src/sparse_life.wgsl`) steps one tile per 256-thread
+  workgroup, two words per thread, with the same bitwise adder as the dense
   engine. Words beyond a tile's edge come from neighbour tiles via a per-tile
   neighbour table. It also reports per tile whether it's alive, which neighbours
   it needs, and its population.
 - Life spreads at most one cell per generation, so the CPU only looks every
-  **16 generations**: it reads back 4 bytes per tile, allocates neighbours
-  wherever life is within 32 cells of an edge, and frees empty tiles. Readbacks
+  **32 generations**: it reads back 4 bytes per tile, allocates neighbours
+  wherever life is within 64 cells of an edge, and frees empty tiles. Readbacks
   are **pipelined** (applied one pass late, from double-buffered staging), so
-  the GPU never waits on the CPU; the 32-cell margin covers the extra delay.
+  the GPU never waits on the CPU; the 64-cell margin covers the extra delay.
+- Tile size and margin are constants (`TILE`, `MARGIN` in `src/tiles.rs` and the
+  two sparse shaders). Measured trade-off: 128×128 tiles with a 64-cell margin
+  are fastest for small patterns; a 32-cell margin is ~5–15% faster on big
+  soups; 64×64 tiles are best for many tiny scattered objects (glider streams).
 - Random soup is a 1000×1000 square at the origin. **T** shades the allocated
   tiles; the overlay shows how full the tile pool is.
 
