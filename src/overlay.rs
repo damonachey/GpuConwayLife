@@ -1,10 +1,6 @@
-//! On-screen FPS overlay, drawn by `overlay.wgsl` with a built-in 3x5 pixel font.
+//! On-screen text overlay, drawn by `overlay.wgsl` with a built-in 3x5 pixel font.
 
-use std::time::{Duration, Instant};
-
-const MAX_CHARS: usize = 32;
-/// How often the FPS reading is refreshed.
-const SAMPLE_PERIOD: Duration = Duration::from_millis(500);
+const MAX_CHARS: usize = 256;
 /// Screen pixels per font pixel, before HiDPI scaling.
 const BASE_SCALE: f32 = 3.0;
 /// Distance of the box from the window's top-left corner, in logical pixels.
@@ -16,8 +12,9 @@ struct Uniforms {
     screen: [f32; 2],
     origin: [f32; 2],
     scale: f32,
-    count: u32,
-    _pad: [u32; 2],
+    cols: u32,
+    rows: u32,
+    _pad: u32,
     glyphs: [[u32; 4]; MAX_CHARS / 4],
 }
 
@@ -26,9 +23,8 @@ pub struct Overlay {
     bind_group: wgpu::BindGroup,
     buffer: wgpu::Buffer,
     uniforms: Uniforms,
+    text: String,
     dirty: bool,
-    frames: u32,
-    sample_start: Instant,
 }
 
 impl Overlay {
@@ -88,17 +84,14 @@ impl Overlay {
             cache: None,
         });
 
-        let mut overlay = Self {
+        Self {
             pipeline,
             bind_group,
             buffer,
             uniforms: bytemuck::Zeroable::zeroed(),
+            text: String::new(),
             dirty: true,
-            frames: 0,
-            sample_start: Instant::now(),
-        };
-        overlay.set_text("-- FPS");
-        overlay
+        }
     }
 
     /// Call when the surface size or DPI scale changes.
@@ -110,16 +103,28 @@ impl Overlay {
         self.dirty = true;
     }
 
-    /// Count one rendered frame, refreshing the FPS text when a sample period ends.
-    pub fn tick(&mut self) {
-        self.frames += 1;
-        let elapsed = self.sample_start.elapsed();
-        if elapsed >= SAMPLE_PERIOD {
-            let fps = f64::from(self.frames) / elapsed.as_secs_f64();
-            self.set_text(&format!("{fps:.0} FPS  {:.2} MS", 1000.0 / fps));
-            self.frames = 0;
-            self.sample_start = Instant::now();
+    /// Set the overlay text. Lines are separated by `\n`; unchanged text is a no-op.
+    /// Text beyond the 256-character grid is cut off.
+    pub fn set_text(&mut self, text: &str) {
+        if text == self.text {
+            return;
         }
+        self.text = text.to_owned();
+
+        let lines: Vec<&str> = text.lines().collect();
+        let cols = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0).max(1);
+        let rows = lines.len().min(MAX_CHARS / cols);
+
+        self.uniforms.glyphs = [[0; 4]; MAX_CHARS / 4];
+        for (r, line) in lines.iter().take(rows).enumerate() {
+            for (c, ch) in line.chars().take(cols).enumerate() {
+                let i = r * cols + c;
+                self.uniforms.glyphs[i / 4][i % 4] = glyph(ch);
+            }
+        }
+        self.uniforms.cols = cols as u32;
+        self.uniforms.rows = rows as u32;
+        self.dirty = true;
     }
 
     /// Upload any changes and draw into `pass`.
@@ -131,17 +136,6 @@ impl Overlay {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.draw(0..6, 0..1);
-    }
-
-    fn set_text(&mut self, text: &str) {
-        self.uniforms.glyphs = Default::default();
-        let mut count = 0;
-        for (i, ch) in text.chars().take(MAX_CHARS).enumerate() {
-            self.uniforms.glyphs[i / 4][i % 4] = glyph(ch);
-            count = i + 1;
-        }
-        self.uniforms.count = count as u32;
-        self.dirty = true;
     }
 }
 
@@ -158,12 +152,39 @@ fn glyph(ch: char) -> u32 {
         '7' => ["###", "..#", "..#", "..#", "..#"],
         '8' => ["###", "#.#", "###", "#.#", "###"],
         '9' => ["###", "#.#", "###", "..#", "###"],
+        'A' => [".#.", "#.#", "###", "#.#", "#.#"],
+        'B' => ["##.", "#.#", "##.", "#.#", "##."],
+        'C' => [".##", "#..", "#..", "#..", ".##"],
+        'D' => ["##.", "#.#", "#.#", "#.#", "##."],
+        'E' => ["###", "#..", "##.", "#..", "###"],
         'F' => ["###", "#..", "##.", "#..", "#.."],
-        'P' => ["##.", "#.#", "##.", "#..", "#.."],
-        'S' => [".##", "#..", ".#.", "..#", "##."],
+        'G' => [".##", "#..", "#.#", "#.#", ".##"],
+        'H' => ["#.#", "#.#", "###", "#.#", "#.#"],
+        'I' => ["###", ".#.", ".#.", ".#.", "###"],
+        'J' => ["..#", "..#", "..#", "#.#", ".#."],
+        'K' => ["#.#", "#.#", "##.", "#.#", "#.#"],
+        'L' => ["#..", "#..", "#..", "#..", "###"],
         'M' => ["#.#", "###", "###", "#.#", "#.#"],
+        'N' => ["##.", "#.#", "#.#", "#.#", "#.#"],
+        'O' => [".#.", "#.#", "#.#", "#.#", ".#."],
+        'P' => ["##.", "#.#", "##.", "#..", "#.."],
+        'Q' => [".#.", "#.#", "#.#", "##.", ".##"],
+        'R' => ["##.", "#.#", "##.", "#.#", "#.#"],
+        'S' => [".##", "#..", ".#.", "..#", "##."],
+        'T' => ["###", ".#.", ".#.", ".#.", ".#."],
+        'U' => ["#.#", "#.#", "#.#", "#.#", "###"],
+        'V' => ["#.#", "#.#", "#.#", "#.#", ".#."],
+        'W' => ["#.#", "#.#", "###", "###", "#.#"],
+        'X' => ["#.#", "#.#", ".#.", "#.#", "#.#"],
+        'Y' => ["#.#", "#.#", ".#.", ".#.", ".#."],
+        'Z' => ["###", "..#", ".#.", "#..", "###"],
         '.' => ["...", "...", "...", "...", ".#."],
+        ',' => ["...", "...", "...", ".#.", "#.."],
+        ':' => ["...", ".#.", "...", ".#.", "..."],
         '-' => ["...", "...", "###", "...", "..."],
+        '+' => ["...", ".#.", "###", ".#.", "..."],
+        '/' => ["..#", "..#", ".#.", "#..", "#.."],
+        '=' => ["...", "###", "...", "###", "..."],
         _ => return 0,
     };
     let mut mask = 0;
