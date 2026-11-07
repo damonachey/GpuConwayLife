@@ -23,6 +23,9 @@ Conway's Game of Life running entirely on the GPU, written in Rust with
 | N       | Step one generation (while paused; hold to repeat) |
 | R       | Reseed with random cells                |
 | 1       | Clear and place a Gosper glider gun in the centre |
+| 2       | Clear and place an acorn in the centre  |
+| 3       | Clear and place Bunnies in the centre   |
+| 4       | Clear and place Ark1 in the centre      |
 | + / -   | Double / halve speed (1/16 to 1024 generations per frame) |
 
 ## Run

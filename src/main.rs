@@ -5,7 +5,7 @@
 //! screen pixel. The CPU only seeds generations; after that it just submits commands.
 //!
 //! Controls: Space pause/resume, N step one generation (while paused),
-//! R reseed, 1 glider gun, +/- change speed.
+//! R reseed, 1 glider gun, 2 acorn, 3 bunnies, 4 Ark1, +/- change speed.
 
 mod overlay;
 mod patterns;
@@ -330,11 +330,12 @@ impl Gpu {
                 sim.single_steps += 1;
             }
             Key::Character(c) if c.eq_ignore_ascii_case("r") && !event.repeat => self.reseed(),
-            Key::Character(c) if c == "1" && !event.repeat => self.load_cells(&patterns::centered(
-                patterns::GOSPER_GLIDER_GUN,
-                GRID_WIDTH,
-                GRID_HEIGHT,
-            )),
+            Key::Character(c) if c == "1" && !event.repeat => {
+                self.load_pattern(patterns::GOSPER_GLIDER_GUN);
+            }
+            Key::Character(c) if c == "2" && !event.repeat => self.load_pattern(patterns::ACORN),
+            Key::Character(c) if c == "3" && !event.repeat => self.load_pattern(patterns::BUNNIES),
+            Key::Character(c) if c == "4" && !event.repeat => self.load_pattern(patterns::ARK1),
             Key::Character(c) if c == "+" || c == "=" => {
                 sim.speed_level = (sim.speed_level + 1).min(MAX_SPEED_LEVEL);
             }
@@ -343,6 +344,11 @@ impl Gpu {
             }
             _ => {}
         }
+    }
+
+    /// Clear the grid and place `pattern` in the centre.
+    fn load_pattern(&mut self, pattern: &[&str]) {
+        self.load_cells(&patterns::centered(pattern, GRID_WIDTH, GRID_HEIGHT));
     }
 
     /// Replace the current generation with fresh random cells.
@@ -366,7 +372,8 @@ impl Gpu {
              GEN {}  {:.0} GEN/S\n\
              SPEED {} GEN/FRAME{state}\n\
              GRID {GRID_WIDTH}X{GRID_HEIGHT}\n\
-             SPACE PAUSE  N STEP  R RESEED  1 GUN  +/- SPEED",
+             SPACE PAUSE  N STEP  R RESEED  +/- SPEED\n\
+             1 GUN  2 ACORN  3 BUNNIES  4 ARK1",
             stats.fps,
             sim.generation,
             stats.gens_per_sec,
