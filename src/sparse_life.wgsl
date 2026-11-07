@@ -16,7 +16,7 @@
 const TILE: u32 = 64u;
 const WORDS_PER_ROW: u32 = 2u;
 const TILE_WORDS: u32 = 128u;
-const MARGIN: u32 = 16u;
+const MARGIN: u32 = 32u;
 const EMPTY: u32 = 0xffffffffu;
 
 struct Params {

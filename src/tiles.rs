@@ -8,9 +8,15 @@
 //!
 //! Life spreads at most one cell per generation. If a tile has a live cell within
 //! `MARGIN` cells of an edge, we make sure the neighbour across that edge exists.
-//! Then the world can safely run `MARGIN` generations before we look again: no live
-//! cell can reach a tile that isn't allocated. The compute shader reports, per tile,
-//! whether it is alive and which neighbours it needs (see [`flags_for`]).
+//! The compute shader reports, per tile, whether it is alive and which neighbours
+//! it needs (see [`flags_for`]), and the CPU looks at those flags every
+//! `BOOKKEEPING_INTERVAL` generations.
+//!
+//! Readbacks are pipelined: flags taken at one bookkeeping point are applied at the
+//! next, while the GPU keeps running. So a tile allocation may be based on flags
+//! up to `2 * BOOKKEEPING_INTERVAL` generations old, and `MARGIN` must be at least
+//! that: a live cell farther than `MARGIN` from an edge can't influence the tile
+//! beyond it for more than `MARGIN` generations.
 
 use std::collections::{HashMap, HashSet};
 
@@ -20,9 +26,12 @@ pub const TILE_CELLS: usize = (TILE * TILE) as usize;
 /// Cells are bit-packed: a tile is 64 rows of 2 `u32` words. Cell index
 /// `y * 64 + x` (see [`locate`]) lives in word `index / 32`, bit `index % 32`.
 pub const TILE_WORDS: usize = TILE_CELLS / 32;
-/// Distance from a tile edge that counts as "near" it, and therefore the number of
-/// generations that may run between bookkeeping passes. Must be <= TILE / 2.
-pub const MARGIN: u32 = 16;
+/// Distance from a tile edge that counts as "near" it. Must be <= TILE / 2, and
+/// must match MARGIN in sparse_life.wgsl.
+pub const MARGIN: u32 = 32;
+/// Generations between bookkeeping passes. Readbacks are applied one pass late, so
+/// this must be at most MARGIN / 2.
+pub const BOOKKEEPING_INTERVAL: u32 = MARGIN / 2;
 /// Neighbour-table entry for "no tile here".
 pub const EMPTY: u32 = u32::MAX;
 /// Flag bit: the tile has at least one live cell.
@@ -142,6 +151,13 @@ impl TileWorld {
         self.map.get(&coord).copied()
     }
 
+    /// Coordinates of the active tiles, in active order: what a flags readback
+    /// taken now will describe. Slots can be reused before the readback is applied,
+    /// so readbacks are matched to coordinates, not slots.
+    pub fn active_coords(&self) -> Vec<TileCoord> {
+        self.active.iter().map(|&s| self.coords[s as usize]).collect()
+    }
+
     /// Rebuild the active list after allocations, so flags can be lined up with it.
     pub fn sync_active(&mut self) {
         if self.active_dirty {
@@ -201,10 +217,18 @@ impl TileWorld {
     /// Bookkeeping pass. `flags[i]` belongs to `self.active()[i]` as it was when the
     /// GPU ran. Keeps live tiles and the neighbours they need; frees everything else.
     pub fn update(&mut self, flags: &[u32]) {
-        debug_assert_eq!(flags.len(), self.active.len());
+        let coords = self.active_coords();
+        self.update_from(&coords, flags);
+    }
+
+    /// Bookkeeping pass from a readback: `flags[i]` belongs to the tile at
+    /// `coords[i]` (a snapshot from [`Self::active_coords`]). Tiles allocated since
+    /// the snapshot are kept only if these flags need them, which is safe because
+    /// `MARGIN >= 2 * BOOKKEEPING_INTERVAL` (see the module docs).
+    pub fn update_from(&mut self, coords: &[TileCoord], flags: &[u32]) {
+        debug_assert_eq!(flags.len(), coords.len());
         let mut needed: HashSet<TileCoord> = HashSet::new();
-        for (&slot, &f) in self.active.iter().zip(flags) {
-            let (x, y) = self.coords[slot as usize];
+        for (&(x, y), &f) in coords.iter().zip(flags) {
             if f & ALIVE != 0 {
                 needed.insert((x, y));
             }
@@ -268,16 +292,20 @@ mod tests {
 
     #[test]
     fn cell_flags_regions() {
-        let mid = TILE / 2;
-        assert_eq!(cell_flags(mid, mid), ALIVE);
-        // Near west edge only: needs west neighbour.
-        assert_eq!(cell_flags(0, mid), ALIVE | 2 << dir_index(-1, 0));
-        // Near south-east corner: needs east, south and south-east.
-        let se = cell_flags(TILE - 1, TILE - 1);
-        assert_eq!(
-            se,
-            ALIVE | 2 << dir_index(1, 0) | 2 << dir_index(0, 1) | 2 << dir_index(1, 1)
-        );
+        let need = |dx, dy| 2 << dir_index(dx, dy);
+        // Corners need their two edge neighbours and the diagonal one.
+        assert_eq!(cell_flags(0, 0), ALIVE | need(-1, 0) | need(0, -1) | need(-1, -1));
+        assert_eq!(cell_flags(TILE - 1, TILE - 1), ALIVE | need(1, 0) | need(0, 1) | need(1, 1));
+        // Just inside the margin on the east side, just outside it on the south.
+        let (x, y) = (TILE - MARGIN, TILE - MARGIN - 1);
+        let expected_y = if y < MARGIN { need(0, -1) | need(1, -1) } else { 0 };
+        assert_eq!(cell_flags(x, y), ALIVE | need(1, 0) | expected_y);
+    }
+
+    #[test]
+    fn margin_constraints_hold() {
+        // Pipelined readbacks are applied one pass late (see module docs).
+        const { assert!(2 * BOOKKEEPING_INTERVAL <= MARGIN && MARGIN <= TILE / 2) };
     }
 
     #[test]
@@ -287,16 +315,14 @@ mod tests {
             let (_, i) = locate(x, y);
             words[i / 32] |= 1 << (i % 32);
         };
-        set(32, 32); // centre: alive only
-        set(0, 32); // west edge
-        set(63, 63); // south-east corner
+        // Cells in different words and rows; flags_for must match the per-cell flags.
+        let cells = [(0, 0), (33, 5), (63, 63), (31, 40)];
+        for &(x, y) in &cells {
+            set(x, y);
+        }
         let f = flags_for(&words);
-        assert_eq!(f >> POP_SHIFT, 3);
-        let expected = ALIVE
-            | 2 << dir_index(-1, 0)
-            | 2 << dir_index(1, 0)
-            | 2 << dir_index(0, 1)
-            | 2 << dir_index(1, 1);
+        assert_eq!(f >> POP_SHIFT, cells.len() as u32);
+        let expected = cells.iter().fold(0, |acc, &(x, y)| acc | cell_flags(x as u32, y as u32));
         assert_eq!(f & ((1 << POP_SHIFT) - 1), expected);
     }
 

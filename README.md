@@ -36,7 +36,9 @@ restarts whatever was last loaded (random soup or a pattern).
   it needs, and its population.
 - Life spreads at most one cell per generation, so the CPU only looks every
   **16 generations**: it reads back 4 bytes per tile, allocates neighbours
-  wherever life is within 16 cells of an edge, and frees empty tiles.
+  wherever life is within 32 cells of an edge, and frees empty tiles. Readbacks
+  are **pipelined** (applied one pass late, from double-buffered staging), so
+  the GPU never waits on the CPU; the 32-cell margin covers the extra delay.
 - Random soup is a 1000×1000 square at the origin. **T** shades the allocated
   tiles; the overlay shows how full the tile pool is.
 

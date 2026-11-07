@@ -69,7 +69,9 @@ pub fn run(ctx: &GpuContext) {
         let mut sparse = SparseEngine::new(ctx);
         sparse.load(&cells);
         let gps = time(ctx, &mut sparse);
-        record(&scenario, "sparse", format!("{} tiles at end", sparse.tile_count()), gps);
+        // A correctness check too: acorn ends at 633 cells, bunnies at 1744.
+        let pop = sparse.population().map_or(0, |(p, _)| p);
+        record(&scenario, "sparse", format!("{} tiles, pop {pop}", sparse.tile_count()), gps);
     }
 
     // 2. Random soup filling an S x S square, with the dense grid sized to fit it
