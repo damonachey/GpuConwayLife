@@ -1,0 +1,48 @@
+# Build output
+bin/
+obj/
+build/
+out/
+dist/
+target/
+*.exe
+*.dll
+*.pdb
+*.obj
+*.o
+*.so
+*.dylib
+*.lib
+*.a
+
+# Dependencies
+node_modules/
+packages/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.swp
+*~
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Syncthing
+.stfolder/
+.stignore
+.stversions/
+*.sync-conflict-*
+
+# Logs / temp
+*.log
+*.tmp
