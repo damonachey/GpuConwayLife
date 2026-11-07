@@ -5,9 +5,10 @@
 //! screen pixel. The CPU only seeds generations; after that it just submits commands.
 //!
 //! Controls: Space pause/resume, N step one generation (while paused),
-//! R reseed, +/- change speed.
+//! R reseed, 1 glider gun, +/- change speed.
 
 mod overlay;
+mod patterns;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,6 +26,8 @@ const WORKGROUP_SIZE: u32 = 8;
 /// Speed is 2^level generations per frame, so -4 is one generation every 16 frames.
 const MIN_SPEED_LEVEL: i32 = -4;
 const MAX_SPEED_LEVEL: i32 = 10;
+/// Largest number of generations recorded into one queue submission.
+const MAX_GENERATIONS_PER_SUBMIT: u32 = 256;
 /// How often FPS and generations/second are recalculated.
 const STATS_PERIOD: Duration = Duration::from_millis(500);
 
@@ -128,7 +131,9 @@ struct Gpu {
 
 impl Gpu {
     async fn new(window: Arc<Window>) -> Self {
-        let instance = wgpu::Instance::default();
+        // Honour wgpu's standard env vars, e.g. WGPU_BACKEND=dx12 or vulkan.
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let surface = instance.create_surface(window.clone()).expect("create surface");
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -325,6 +330,11 @@ impl Gpu {
                 sim.single_steps += 1;
             }
             Key::Character(c) if c.eq_ignore_ascii_case("r") && !event.repeat => self.reseed(),
+            Key::Character(c) if c == "1" && !event.repeat => self.load_cells(&patterns::centered(
+                patterns::GOSPER_GLIDER_GUN,
+                GRID_WIDTH,
+                GRID_HEIGHT,
+            )),
             Key::Character(c) if c == "+" || c == "=" => {
                 sim.speed_level = (sim.speed_level + 1).min(MAX_SPEED_LEVEL);
             }
@@ -337,9 +347,14 @@ impl Gpu {
 
     /// Replace the current generation with fresh random cells.
     fn reseed(&mut self) {
-        let cells = random_cells(GRID_WIDTH * GRID_HEIGHT, time_seed());
-        self.queue.write_buffer(&self.cell_buffers[self.current], 0, bytemuck::cast_slice(&cells));
+        self.load_cells(&random_cells(GRID_WIDTH * GRID_HEIGHT, time_seed()));
+    }
+
+    /// Replace the current generation with `cells` and restart the generation count.
+    fn load_cells(&mut self, cells: &[u32]) {
+        self.queue.write_buffer(&self.cell_buffers[self.current], 0, bytemuck::cast_slice(cells));
         self.sim.generation = 0;
+        self.sim.pending = 0.0;
     }
 
     fn overlay_text(&self) -> String {
@@ -351,7 +366,7 @@ impl Gpu {
              GEN {}  {:.0} GEN/S\n\
              SPEED {} GEN/FRAME{state}\n\
              GRID {GRID_WIDTH}X{GRID_HEIGHT}\n\
-             SPACE PAUSE  N STEP  R RESEED  +/- SPEED",
+             SPACE PAUSE  N STEP  R RESEED  1 GUN  +/- SPEED",
             stats.fps,
             sim.generation,
             stats.gens_per_sec,
@@ -380,24 +395,33 @@ impl Gpu {
             }
         };
         let view = frame.texture.create_view(&Default::default());
-        let mut encoder = self.device.create_command_encoder(&Default::default());
 
         let generations = self.sim.take_generations();
-        if generations > 0 {
-            // Each dispatch is its own synchronization scope, so ping-ponging
-            // between bind groups inside one pass is safe.
-            let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.compute_pipeline);
-            for _ in 0..generations {
-                pass.set_bind_group(0, &self.compute_bind_groups[self.current], &[]);
-                pass.dispatch_workgroups(
-                    GRID_WIDTH.div_ceil(WORKGROUP_SIZE),
-                    GRID_HEIGHT.div_ceil(WORKGROUP_SIZE),
-                    1,
-                );
-                self.current = 1 - self.current;
+        // Submit the simulation in chunks: the NVIDIA Vulkan driver (560.94) crashes
+        // with STATUS_INTEGER_DIVIDE_BY_ZERO when one submission holds ~1024 dispatches.
+        let mut remaining = generations;
+        while remaining > 0 {
+            let chunk = remaining.min(MAX_GENERATIONS_PER_SUBMIT);
+            remaining -= chunk;
+            let mut encoder = self.device.create_command_encoder(&Default::default());
+            {
+                // Each dispatch is its own synchronization scope, so ping-ponging
+                // between bind groups inside one pass is safe.
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.compute_pipeline);
+                for _ in 0..chunk {
+                    pass.set_bind_group(0, &self.compute_bind_groups[self.current], &[]);
+                    pass.dispatch_workgroups(
+                        GRID_WIDTH.div_ceil(WORKGROUP_SIZE),
+                        GRID_HEIGHT.div_ceil(WORKGROUP_SIZE),
+                        1,
+                    );
+                    self.current = 1 - self.current;
+                }
             }
+            self.queue.submit([encoder.finish()]);
         }
+        let mut encoder = self.device.create_command_encoder(&Default::default());
         self.sim.generation += u64::from(generations);
         self.stats.record(generations);
         self.overlay.set_text(&self.overlay_text());

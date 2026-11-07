@@ -22,6 +22,7 @@ Conway's Game of Life running entirely on the GPU, written in Rust with
 | Space   | Pause / resume                          |
 | N       | Step one generation (while paused; hold to repeat) |
 | R       | Reseed with random cells                |
+| 1       | Clear and place a Gosper glider gun in the centre |
 | + / -   | Double / halve speed (1/16 to 1024 generations per frame) |
 
 ## Run
