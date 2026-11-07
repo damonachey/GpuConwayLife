@@ -30,10 +30,11 @@ restarts whatever was last loaded (random soup or a pattern).
   live cells exist. Tiles are **bit-packed** (128 rows × 4 words = 2 KB), so the
   GPU pool holds up to **262,144 tiles ≈ 4.3 billion cells** (2 × 512 MiB).
 - The compute shader (`src/sparse_life.wgsl`) steps one tile per 256-thread
-  workgroup, two words per thread, with the same bitwise adder as the dense
-  engine. Words beyond a tile's edge come from neighbour tiles via a per-tile
-  neighbour table. It also reports per tile whether it's alive, which neighbours
-  it needs, and its population.
+  workgroup. It first copies the tile plus a 1-cell border (from the neighbour
+  tiles, via a per-tile neighbour table) into **workgroup shared memory**, then
+  computes two words per thread from there with the same bitwise adder as the
+  dense engine. It also reports per tile whether it's alive, which neighbours it
+  needs, and its population.
 - Life spreads at most one cell per generation, so the CPU only looks every
   **32 generations**: it reads back 4 bytes per tile, allocates neighbours
   wherever life is within 64 cells of an edge, and frees empty tiles. Readbacks

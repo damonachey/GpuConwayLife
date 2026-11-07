@@ -82,6 +82,8 @@ pub struct SparseEngine {
     generation: u64,
     /// Live cells as of the last bookkeeping pass, and that pass's generation.
     population: (u64, u64),
+    /// Total CPU time spent applying readbacks (for the benchmark).
+    bookkeeping_time: std::time::Duration,
 }
 
 impl SparseEngine {
@@ -223,7 +225,13 @@ impl SparseEngine {
             show_tiles: false,
             generation: 0,
             population: (0, 0),
+            bookkeeping_time: std::time::Duration::ZERO,
         }
+    }
+
+    /// CPU time spent applying readbacks so far, and reset the counter.
+    pub fn take_bookkeeping_time(&mut self) -> std::time::Duration {
+        std::mem::take(&mut self.bookkeeping_time)
     }
 
     /// Number of allocated tiles.
@@ -292,8 +300,10 @@ impl SparseEngine {
             let flags = self.finish_readback(&previous);
             let population = flags.iter().map(|f| u64::from(f >> tiles::POP_SHIFT)).sum();
             self.population = (population, previous.generation);
+            let start = std::time::Instant::now();
             self.world.update_from(&previous.coords, &flags);
             self.apply_world_changes();
+            self.bookkeeping_time += start.elapsed();
         }
         self.since_bookkeeping = 0;
     }

@@ -3,12 +3,13 @@
 // The world is made of TILE x TILE tiles stored in a pool (`src` / `dst`,
 // ping-ponged each generation). Cells are bit-packed: a tile is TILE rows of
 // WORDS_PER_ROW u32 words, and bit i of word wx in row y is tile-local cell
-// (wx * 32 + i, y). One workgroup processes one active tile; each thread computes
-// TILE_WORDS / THREADS words.
+// (wx * 32 + i, y). One workgroup processes one active tile.
 //
-// Words outside a tile are read through that tile's neighbour table; a missing
-// neighbour (EMPTY) counts as dead. The CPU guarantees that can't matter until its
-// next bookkeeping pass (see tiles.rs).
+// Each workgroup first copies its tile plus a one-word / one-row border (taken from
+// the neighbour tiles via the neighbour table; a missing neighbour (EMPTY) reads as
+// dead) into workgroup memory, then computes every word from there. The CPU
+// guarantees missing neighbours can't matter until its next bookkeeping pass (see
+// tiles.rs).
 //
 // Each workgroup also reports flags for its tile: bit 0 = any live cell, bit 1+d =
 // "a live cell is within MARGIN of the edge/corner toward neighbour d", and bits
@@ -22,6 +23,10 @@ const WORDS_PER_ROW: u32 = TILE / 32u;
 const TILE_WORDS: u32 = TILE * WORDS_PER_ROW;
 const THREADS: u32 = 256u;
 const EMPTY: u32 = 0xffffffffu;
+// The tile plus a border: rows -1..TILE, word columns -1..WORDS_PER_ROW.
+const HALO_COLS: u32 = WORDS_PER_ROW + 2u;
+const HALO_ROWS: u32 = TILE + 2u;
+const HALO_WORDS: u32 = HALO_COLS * HALO_ROWS;
 
 struct Params {
     count: u32, // number of active tiles
@@ -36,6 +41,10 @@ struct Params {
 
 var<workgroup> tile_flags: atomic<u32>;
 var<workgroup> tile_pop: atomic<u32>;
+/// This tile's 8 neighbour slots (DIRS order).
+var<workgroup> near_slots: array<u32, 8>;
+/// The tile plus its border, as `halo[(y + 1) * HALO_COLS + (wx + 1)]`.
+var<workgroup> halo: array<u32, HALO_WORDS>;
 
 // Index into the neighbour row for a non-zero offset; matches DIRS in tiles.rs.
 fn dir_index(dx: i32, dy: i32) -> u32 {
@@ -43,17 +52,16 @@ fn dir_index(dx: i32, dy: i32) -> u32 {
     return select(k - 1u, k, k < 4u);
 }
 
-// Word at tile-local word column `wx` (-1..WORDS_PER_ROW) and row `y` (-1..TILE):
-// may be one word or one row outside the tile, in which case it comes from a
-// neighbour tile.
-fn read_word(slot: u32, wx: i32, y: i32) -> u32 {
+// Word at tile-local word column `wx` (-1..WORDS_PER_ROW) and row `y` (-1..TILE),
+// from this tile or a neighbour, straight from the pool.
+fn load_word(slot: u32, wx: i32, y: i32) -> u32 {
     let wpr = i32(WORDS_PER_ROW);
     let t = i32(TILE);
     let dx = select(select(0, 1, wx >= wpr), -1, wx < 0);
     let dy = select(select(0, 1, y >= t), -1, y < 0);
     var s = slot;
     if (dx != 0 || dy != 0) {
-        s = neighbors[slot * 8u + dir_index(dx, dy)];
+        s = near_slots[dir_index(dx, dy)];
         if (s == EMPTY) {
             return 0u;
         }
@@ -102,22 +110,35 @@ fn step(
         atomicStore(&tile_flags, 0u);
         atomicStore(&tile_pop, 0u);
     }
+    if (lindex < 8u) {
+        near_slots[lindex] = neighbors[slot * 8u + lindex];
+    }
+    workgroupBarrier();
+
+    // Copy the tile and its border into workgroup memory.
+    for (var i = lindex; i < HALO_WORDS; i += THREADS) {
+        let wx = i32(i % HALO_COLS) - 1;
+        let y = i32(i / HALO_COLS) - 1;
+        halo[i] = load_word(slot, wx, y);
+    }
     workgroupBarrier();
 
     var f = 0u;
     var pop = 0u;
     for (var word = lindex; word < TILE_WORDS; word += THREADS) {
-        let wx = i32(word % WORDS_PER_ROW);
-        let y = i32(word / WORDS_PER_ROW);
-        let ul = read_word(slot, wx - 1, y - 1);
-        let u = read_word(slot, wx, y - 1);
-        let ur = read_word(slot, wx + 1, y - 1);
-        let ml = read_word(slot, wx - 1, y);
-        let m = src[slot * TILE_WORDS + word];
-        let mr = read_word(slot, wx + 1, y);
-        let dl = read_word(slot, wx - 1, y + 1);
-        let d = read_word(slot, wx, y + 1);
-        let dr = read_word(slot, wx + 1, y + 1);
+        let wx = word % WORDS_PER_ROW;
+        let y = word / WORDS_PER_ROW;
+        // Centre of this word in the halo; neighbours are +-1 column, +-HALO_COLS.
+        let c = (y + 1u) * HALO_COLS + wx + 1u;
+        let ul = halo[c - HALO_COLS - 1u];
+        let u = halo[c - HALO_COLS];
+        let ur = halo[c - HALO_COLS + 1u];
+        let ml = halo[c - 1u];
+        let m = halo[c];
+        let mr = halo[c + 1u];
+        let dl = halo[c + HALO_COLS - 1u];
+        let d = halo[c + HALO_COLS];
+        let dr = halo[c + HALO_COLS + 1u];
 
         // West neighbour of bit i is bit i-1 (from the left word at bit 0);
         // east neighbour is bit i+1 (from the right word at bit 31).
@@ -136,10 +157,10 @@ fn step(
 
         if (next != 0u) {
             // Which edges / corners have a live cell within MARGIN of them.
-            let near_w = (next & bits_in(u32(wx), 0u, MARGIN)) != 0u;
-            let near_e = (next & bits_in(u32(wx), TILE - MARGIN, TILE)) != 0u;
-            let near_n = u32(y) < MARGIN;
-            let near_s = u32(y) >= TILE - MARGIN;
+            let near_w = (next & bits_in(wx, 0u, MARGIN)) != 0u;
+            let near_e = (next & bits_in(wx, TILE - MARGIN, TILE)) != 0u;
+            let near_n = y < MARGIN;
+            let near_s = y >= TILE - MARGIN;
             f |= 1u;
             if (near_w) { f |= 2u << dir_index(-1, 0); }
             if (near_e) { f |= 2u << dir_index(1, 0); }

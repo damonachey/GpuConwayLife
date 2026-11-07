@@ -22,7 +22,8 @@ struct Result {
     gens_per_sec: f64,
 }
 
-fn time(ctx: &GpuContext, engine: &mut dyn Engine) -> f64 {
+/// Generations per second, and the wall time measured.
+fn time(ctx: &GpuContext, engine: &mut dyn Engine) -> (f64, Duration) {
     let wait = || {
         let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
     };
@@ -39,7 +40,8 @@ fn time(ctx: &GpuContext, engine: &mut dyn Engine) -> f64 {
         }
     }
     wait();
-    generations as f64 / start.elapsed().as_secs_f64()
+    let elapsed = start.elapsed();
+    (generations as f64 / elapsed.as_secs_f64(), elapsed)
 }
 
 pub fn run(ctx: &GpuContext) {
@@ -62,13 +64,13 @@ pub fn run(ctx: &GpuContext) {
         let mut dense = pollster::block_on(DenseEngine::new(ctx));
         dense.load(&cells);
         let setup = format!("grid {}", dense.info());
-        let gps = time(ctx, &mut dense);
+        let (gps, _) = time(ctx, &mut dense);
         record(&scenario, "dense", setup, gps);
         drop(dense);
 
         let mut sparse = SparseEngine::new(ctx);
         sparse.load(&cells);
-        let gps = time(ctx, &mut sparse);
+        let (gps, _) = time(ctx, &mut sparse);
         // A correctness check too: acorn ends at 633 cells, bunnies at 1744.
         let pop = sparse.population().map_or(0, |(p, _)| p);
         record(&scenario, "sparse", format!("{} tiles, pop {pop}", sparse.tile_count()), gps);
@@ -81,15 +83,19 @@ pub fn run(ctx: &GpuContext) {
         let mut dense = pollster::block_on(DenseEngine::with_side(ctx, side));
         dense.random(); // fills the whole grid
         let setup = dense.info();
-        let gps = time(ctx, &mut dense);
+        let (gps, _) = time(ctx, &mut dense);
         record(&scenario, "dense", setup, gps);
         drop(dense);
 
         let mut sparse = SparseEngine::new(ctx);
         sparse.load(&patterns::random_square(side as i32, crate::engine::time_seed()));
         let start_tiles = sparse.tile_count();
-        let gps = time(ctx, &mut sparse);
-        record(&scenario, "sparse", format!("{start_tiles} -> {} tiles", sparse.tile_count()), gps);
+        sparse.take_bookkeeping_time();
+        let (gps, wall) = time(ctx, &mut sparse);
+        // Share of wall time the CPU spent on bookkeeping (it overlaps GPU work).
+        let cpu = 100.0 * sparse.take_bookkeeping_time().as_secs_f64() / wall.as_secs_f64();
+        let setup = format!("{start_tiles} -> {} tiles, cpu {cpu:.0}%", sparse.tile_count());
+        record(&scenario, "sparse", setup, gps);
     }
 
     // Summary: winner per scenario.
