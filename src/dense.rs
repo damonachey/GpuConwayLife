@@ -285,6 +285,17 @@ impl DenseEngine {
         }
     }
 
+    /// Plain-text grid description for logs and the benchmark, e.g.
+    /// "grid 16384x16384, 32.0 MB x 2". (`info()` is the upper-case HUD version.)
+    pub fn describe(&self) -> String {
+        format!(
+            "grid {}x{}, {} x 2",
+            self.grid.width,
+            self.grid.height,
+            human(self.grid.bytes() as f64, BYTE_UNITS)
+        )
+    }
+
     fn restart(&mut self) {
         self.generation = 0;
         // Count the new world promptly (an in-flight count of the old one is still

@@ -63,7 +63,7 @@ pub fn run(ctx: &GpuContext) {
         let scenario = format!("{name} (small pattern)");
         let mut dense = pollster::block_on(DenseEngine::new(ctx));
         dense.load(&cells);
-        let setup = format!("grid {}", dense.info());
+        let setup = dense.describe();
         let (gps, _) = time(ctx, &mut dense);
         record(&scenario, "dense", setup, gps);
         drop(dense);
@@ -82,7 +82,7 @@ pub fn run(ctx: &GpuContext) {
         let scenario = format!("soup {side}x{side}, grid = soup size");
         let mut dense = pollster::block_on(DenseEngine::with_side(ctx, side));
         dense.random(); // fills the whole grid
-        let setup = dense.info();
+        let setup = dense.describe();
         let (gps, _) = time(ctx, &mut dense);
         record(&scenario, "dense", setup, gps);
         drop(dense);
