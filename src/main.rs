@@ -25,6 +25,10 @@ use winit::window::{Window, WindowId};
 
 /// Upper bound on each of the two cell buffers (most GPUs allow ~2 GiB per binding).
 const MAX_BUFFER_BYTES: u64 = 2 << 30;
+/// Default grid side: 32768² ≈ 1.07 billion cells (128 MiB per buffer). Big enough
+/// for most patterns to run free, small enough to stay fast. `LIFE_GRID` can go
+/// higher, up to what the GPU allows.
+const DEFAULT_GRID_SIDE: u32 = 32768;
 /// Matches `@workgroup_size(64, 4)` in life.wgsl: 64 words across, 4 rows down.
 const WORKGROUP_SIZE: (u32, u32) = (64, 4);
 
@@ -248,14 +252,12 @@ impl Gpu {
 
         // --- Buffers -------------------------------------------------------
 
-        // Grid size: LIFE_GRID=<side> if set, else the largest that fits the limits.
+        // Grid size: LIFE_GRID=<side> if set, else DEFAULT_GRID_SIDE; either way no
+        // bigger than the GPU's limits allow.
         let requested = std::env::var("LIFE_GRID").ok().and_then(|s| s.trim().parse::<u32>().ok());
-        let mut grid = match requested {
-            Some(side) => Grid::square(side),
-            None => Grid::square_fitting(max_buffer),
-        };
+        let mut grid = Grid::square(requested.unwrap_or(DEFAULT_GRID_SIDE));
         if grid.bytes() > max_buffer {
-            log::warn!("LIFE_GRID {} is too big for this GPU; shrinking", grid.width);
+            log::warn!("{0}x{0} grid is too big for this GPU; shrinking", grid.width);
             grid = Grid::square_fitting(max_buffer);
         }
         // The limits say what's addressable, not what's free: if allocation fails,

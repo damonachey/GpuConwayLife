@@ -6,9 +6,10 @@ Conway's Game of Life running entirely on the GPU, written in Rust with
 ## How it works
 
 - Cells are **bit-packed**, 32 to a `u32`, in two GPU storage buffers
-  (ping-pong). The grid is as large as the GPU allows, up to 2 GiB per buffer:
-  on an RTX 3070 that's **131,040 × 131,040 ≈ 17.2 billion cells**. If the
-  allocation fails, the grid shrinks until it fits.
+  (ping-pong). The default grid is **32,768 × 32,768 ≈ 1.07 billion cells**
+  (128 MiB per buffer). `LIFE_GRID` can go up to what the GPU allows, up to
+  2 GiB per buffer: on an RTX 3070 that's 131,040 × 131,040 ≈ 17.2 billion
+  cells. If the allocation fails, the grid shrinks until it fits.
 - **Edges are dead**: everything beyond the grid counts as empty, so patterns
   that reach the border die there instead of wrapping.
 - A **compute shader** (`src/life.wgsl`) computes 32 cells per thread: it shifts
@@ -27,7 +28,8 @@ Measured on an RTX 3070: ~1.4 trillion cell updates/second on large grids,
 versus ~22 billion with the previous one-`u32`-per-cell version. Verified with
 the acorn, which reaches its known final population of 633.
 
-Set `LIFE_GRID=<side>` to pick a smaller square grid, e.g. `LIFE_GRID=4096`.
+Set `LIFE_GRID=<side>` to pick another square grid size, e.g. `LIFE_GRID=4096`
+or `LIFE_GRID=131072` (capped at what the GPU allows).
 
 ## Controls
 
