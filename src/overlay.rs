@@ -1,6 +1,6 @@
 //! On-screen text overlay, drawn by `overlay.wgsl` with a built-in 3x5 pixel font.
 
-const MAX_CHARS: usize = 256;
+const MAX_CHARS: usize = 1024;
 /// Screen pixels per font pixel, before HiDPI scaling.
 const BASE_SCALE: f32 = 3.0;
 /// Distance of the box from the window's top-left corner, in logical pixels.
@@ -104,7 +104,7 @@ impl Overlay {
     }
 
     /// Set the overlay text. Lines are separated by `\n`; unchanged text is a no-op.
-    /// Text beyond the 256-character grid is cut off.
+    /// Text beyond the 1024-character grid is cut off.
     pub fn set_text(&mut self, text: &str) {
         if text == self.text {
             return;
@@ -185,6 +185,7 @@ fn glyph(ch: char) -> u32 {
         '+' => ["...", ".#.", "###", ".#.", "..."],
         '/' => ["..#", "..#", ".#.", "#..", "#.."],
         '=' => ["...", "###", "...", "###", "..."],
+        '%' => ["#.#", "..#", ".#.", "#..", "#.#"],
         _ => return 0,
     };
     let mut mask = 0;

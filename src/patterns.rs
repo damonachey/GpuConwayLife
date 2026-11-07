@@ -79,3 +79,19 @@ pub fn centered(pattern: &[&str]) -> Vec<(i32, i32)> {
     }
     cells
 }
+
+/// A `size` x `size` square of random soup (about 25% alive) centred on the origin.
+pub fn random_square(size: i32, mut state: u32) -> Vec<(i32, i32)> {
+    let mut cells = Vec::new();
+    for y in 0..size {
+        for x in 0..size {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            if state % 4 == 0 {
+                cells.push((x - size / 2, y - size / 2));
+            }
+        }
+    }
+    cells
+}

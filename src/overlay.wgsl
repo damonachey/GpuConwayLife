@@ -12,7 +12,7 @@ struct Overlay {
     cols: u32,           // characters per line
     rows: u32,           // number of lines
     _pad: u32,
-    glyphs: array<vec4<u32>, 64>, // up to 256 glyph masks, 4 per vec4, row-major
+    glyphs: array<vec4<u32>, 256>, // up to 1024 glyph masks, 4 per vec4, row-major
 }
 
 @group(0) @binding(0) var<uniform> ov: Overlay;

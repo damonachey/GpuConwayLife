@@ -3,7 +3,11 @@
 Conway's Game of Life running entirely on the GPU, written in Rust with
 [wgpu](https://wgpu.rs) and [winit](https://github.com/rust-windowing/winit).
 
-## How it works
+Two simulation engines share one app; press **E** to switch between them.
+Switching frees the current engine's GPU memory, builds the other one and
+restarts whatever was last loaded (random soup or a pattern).
+
+## Dense engine (`src/dense.rs`) — the default
 
 - Cells are **bit-packed**, 32 to a `u32`, in two GPU storage buffers
   (ping-pong). The default grid is **16,384 × 16,384 ≈ 268 million cells**
@@ -12,24 +16,33 @@ Conway's Game of Life running entirely on the GPU, written in Rust with
   cells. If the allocation fails, the grid shrinks until it fits.
 - **Edges are dead**: everything beyond the grid counts as empty, so patterns
   that reach the border die there instead of wrapping.
-- A **compute shader** (`src/life.wgsl`) computes 32 cells per thread: it shifts
-  the 9 surrounding words into 8 neighbour words and adds them with a bitwise
-  adder, so all 32 neighbour counts happen in parallel.
-- Random soup is generated **on the GPU** (a hash per word), and the
+- The compute shader (`src/dense_life.wgsl`) computes 32 cells per thread: it
+  shifts the 9 surrounding words into 8 neighbour words and adds them with a
+  bitwise adder, so all 32 neighbour counts happen in parallel.
+- Random soup fills the whole grid and is generated **on the GPU**; the
   population is counted on the GPU and read back in the background.
-- A **fragment shader** (`src/render.wgsl`) draws the middle of the grid, one
-  cell per screen pixel. Cell data never round-trips through the CPU.
-- A small overlay (`src/overlay.wgsl`, built-in 3x5 pixel font) shows FPS,
-  generations/second, cell updates/second, population, speed and grid size.
-- Each frame does at most ~100 ms of simulation, so huge grids at high speed
-  stay responsive (excess requested generations are dropped).
+- Measured on an RTX 3070: ~1.4 trillion cell updates/second, versus ~22 billion
+  with the earlier one-`u32`-per-cell version.
 
-Measured on an RTX 3070: ~1.4 trillion cell updates/second on large grids,
-versus ~22 billion with the previous one-`u32`-per-cell version. Verified with
-the acorn, which reaches its known final population of 633.
+## Sparse engine (`src/sparse.rs`, `src/tiles.rs`)
 
-Set `LIFE_GRID=<side>` to pick another square grid size, e.g. `LIFE_GRID=4096`
-or `LIFE_GRID=131072` (capped at what the GPU allows).
+- The world is **unbounded**: it's cut into 64×64 tiles, and only tiles near
+  live cells exist, in a GPU pool of up to 32,768 tiles (2 × 512 MiB).
+- The compute shader (`src/sparse_life.wgsl`) steps one tile per workgroup,
+  reading across tile edges through a per-tile neighbour table, and reports per
+  tile whether it's alive, which neighbours it needs, and its population.
+- Life spreads at most one cell per generation, so the CPU only looks every
+  **16 generations**: it reads back 4 bytes per tile, allocates neighbours
+  wherever life is within 16 cells of an edge, and frees empty tiles.
+- Random soup is a 1000×1000 square at the origin. **T** shades the allocated
+  tiles; the overlay shows how full the tile pool is.
+
+Both engines draw one cell per screen pixel, centred on the world's middle, and
+both are verified with the acorn, which reaches its known final population of
+633 (the dense engine until its escaping gliders reach the dead edges).
+
+Each frame does at most ~100 ms of simulation, so big worlds at high speed stay
+responsive (excess requested generations are dropped).
 
 ## Controls
 
@@ -37,11 +50,13 @@ or `LIFE_GRID=131072` (capped at what the GPU allows).
 | ------- | --------------------------------------- |
 | Space   | Pause / resume                          |
 | N       | Step one generation (while paused; hold to repeat) |
-| R       | Reseed with random cells                |
-| 1       | Clear and place a Gosper glider gun in the centre |
-| 2       | Clear and place an acorn in the centre  |
-| 3       | Clear and place Bunnies in the centre   |
-| 4       | Clear and place Ark1 in the centre      |
+| R       | Random soup                             |
+| 1       | Gosper glider gun                       |
+| 2       | Acorn                                   |
+| 3       | Bunnies                                 |
+| 4       | Ark1                                    |
+| E       | Switch engine (dense ↔ sparse), restarting the current pattern |
+| T       | Show / hide allocated tiles (sparse engine) |
 | + / -   | Double / halve speed (1/16 to 1024 generations per frame) |
 
 ## Run
@@ -49,6 +64,9 @@ or `LIFE_GRID=131072` (capped at what the GPU allows).
 ```sh
 cargo run --release
 ```
+
+Set `LIFE_GRID=<side>` to pick the dense engine's grid size, e.g.
+`LIFE_GRID=4096` or `LIFE_GRID=131072` (capped at what the GPU allows).
 
 On Windows this needs the MSVC C++ build tools (the "Desktop development with C++"
 workload in Visual Studio or Build Tools).

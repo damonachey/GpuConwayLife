@@ -1,107 +1,58 @@
-//! GPU Conway's Game of Life on a huge, bit-packed grid.
+//! GPU Conway's Game of Life with two swappable engines.
 //!
-//! Cells are stored one bit each, 32 to a `u32`. The grid is as large as the GPU
-//! allows (each of the two ping-pong buffers up to `MAX_BUFFER_BYTES`), or the size
-//! given by the `LIFE_GRID` environment variable. The simulation runs in a wgpu
-//! compute shader (`life.wgsl`) and is drawn by a fragment shader (`render.wgsl`)
-//! that reads the same GPU buffer, one cell per screen pixel, centred on the grid's
-//! middle. Random soup is generated on the GPU too.
+//! - **Dense** (`dense.rs`): one huge bit-packed grid with dead edges.
+//! - **Sparse** (`sparse.rs`): an unbounded world of 64x64 tiles that grows and
+//!   shrinks with the life in it.
 //!
-//! Controls: Space pause/resume, N step one generation (while paused),
-//! R reseed, 1 glider gun, 2 acorn, 3 bunnies, 4 Ark1, +/- change speed.
+//! This file holds what they share: the window, keyboard, speed control, stats and
+//! the text overlay. Pressing E drops the current engine (freeing its GPU memory),
+//! builds the other one and restarts whatever was last loaded.
+//!
+//! Controls: Space pause/resume, N step (while paused), R random soup, 1 glider gun,
+//! 2 acorn, 3 bunnies, 4 Ark1, E switch engine, T show tiles (sparse), +/- speed.
 
+mod dense;
+mod engine;
 mod overlay;
 mod patterns;
+mod sparse;
+mod tiles;
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use engine::{Engine, GpuContext, human};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
-/// Upper bound on each of the two cell buffers (most GPUs allow ~2 GiB per binding).
+/// Upper bound on any single GPU buffer (most GPUs allow ~2 GiB per binding).
 const MAX_BUFFER_BYTES: u64 = 2 << 30;
-/// Default grid side: 16384² ≈ 268 million cells (32 MiB per buffer). Plenty of
-/// room for most patterns' cores, and fast (~5,000 generations/s on an RTX 3070).
-/// `LIFE_GRID` can go higher, up to what the GPU allows.
-const DEFAULT_GRID_SIDE: u32 = 16384;
-/// Matches `@workgroup_size(64, 4)` in life.wgsl: 64 words across, 4 rows down.
-const WORKGROUP_SIZE: (u32, u32) = (64, 4);
-
 /// Speed is 2^level generations per frame, so -4 is one generation every 16 frames.
 const MIN_SPEED_LEVEL: i32 = -4;
 const MAX_SPEED_LEVEL: i32 = 10;
-/// Largest number of generations recorded into one queue submission. (The NVIDIA
-/// 560.94 Vulkan driver crashed with ~1024 dispatches in one submission.)
-const MAX_GENERATIONS_PER_SUBMIT: u32 = 64;
-/// Cap on simulation work per frame, so huge grids at high speed stay responsive.
+/// Cap on simulation work per frame, so big worlds at high speed stay responsive.
 /// Generations per frame are limited to what the GPU did in this much time recently.
 const FRAME_BUDGET: Duration = Duration::from_millis(100);
 /// How often FPS and generations/second are recalculated.
 const STATS_PERIOD: Duration = Duration::from_millis(500);
 
-/// Grid dimensions. Width is a multiple of 32 so rows are whole words.
-#[derive(Clone, Copy, Debug)]
-struct Grid {
-    width: u32,
-    height: u32,
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum EngineKind {
+    Dense,
+    Sparse,
 }
 
-impl Grid {
-    /// Largest square grid whose bit-packed buffer fits in `bytes`.
-    fn square_fitting(bytes: u64) -> Self {
-        let side = ((bytes * 8) as f64).sqrt() as u32;
-        Self::square(side)
-    }
-
-    /// A square grid of about `side` cells (rounded down to a multiple of 32).
-    fn square(side: u32) -> Self {
-        let side = (side / 32).max(1) * 32;
-        Self { width: side, height: side }
-    }
-
-    fn words_per_row(&self) -> u32 {
-        self.width / 32
-    }
-
-    fn bytes(&self) -> u64 {
-        u64::from(self.words_per_row()) * 4 * u64::from(self.height)
-    }
-
-    fn cells(&self) -> u64 {
-        u64::from(self.width) * u64::from(self.height)
-    }
-
-    fn dispatch_size(&self) -> (u32, u32) {
-        (self.words_per_row().div_ceil(WORKGROUP_SIZE.0), self.height.div_ceil(WORKGROUP_SIZE.1))
-    }
+/// What the world was last started from, so an engine switch can restart it.
+#[derive(Clone, Copy)]
+enum Start {
+    Random,
+    Pattern(&'static [&'static str]),
 }
 
-/// Compute shader parameters; matches `Params` in life.wgsl.
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct Params {
-    width: u32,
-    height: u32,
-    words_per_row: u32,
-    seed: u32,
-}
-
-/// Where the grid sits on screen, for the render shader.
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct View {
-    grid: [u32; 2],
-    offset: [i32; 2],
-    words_per_row: u32,
-    _pad: u32,
-}
-
-/// Simulation state controlled from the keyboard.
+/// Simulation pacing controlled from the keyboard.
 struct Sim {
     paused: bool,
     speed_level: i32,
@@ -109,7 +60,6 @@ struct Sim {
     pending: f64,
     /// Generations requested with N while paused.
     single_steps: u32,
-    generation: u64,
 }
 
 impl Sim {
@@ -147,6 +97,10 @@ struct Stats {
 }
 
 impl Stats {
+    fn new() -> Self {
+        Self { sample_start: Instant::now(), frames: 0, generations: 0, fps: 0.0, gens_per_sec: 0.0 }
+    }
+
     fn record(&mut self, generations: u32) {
         self.frames += 1;
         self.generations += u64::from(generations);
@@ -162,52 +116,20 @@ impl Stats {
     }
 }
 
-/// Matches COUNTERS in life.wgsl.
-const POP_COUNTERS: u64 = 1024;
-/// How often the population is measured.
-const POPULATION_PERIOD: Duration = Duration::from_millis(500);
-
-/// Background population counting: a GPU pass writes partial counts, which are
-/// copied to a staging buffer and read back without stalling the frame loop.
-struct Population {
-    /// Generation being counted, while a readback is in flight.
-    in_flight: Option<u64>,
-    /// Set by the map callback once the staging buffer is readable.
-    mapped: Arc<std::sync::atomic::AtomicBool>,
-    last_request: Instant,
-    /// Latest result: (live cells, generation).
-    value: Option<(u64, u64)>,
-}
-
-struct Gpu {
+struct App {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    compute_pipeline: wgpu::ComputePipeline,
-    seed_pipeline: wgpu::ComputePipeline,
-    count_pipeline: wgpu::ComputePipeline,
-    render_pipeline: wgpu::RenderPipeline,
-    grid: Grid,
-    params_buffer: wgpu::Buffer,
-    count_buffer: wgpu::Buffer,
-    count_staging: wgpu::Buffer,
-    population: Population,
-    cell_buffers: [wgpu::Buffer; 2],
-    view_buffer: wgpu::Buffer,
-    /// `compute_bind_groups[i]` reads buffer `i` and writes buffer `1 - i`.
-    compute_bind_groups: [wgpu::BindGroup; 2],
-    /// `render_bind_groups[i]` draws buffer `i`.
-    render_bind_groups: [wgpu::BindGroup; 2],
-    /// Index of the buffer that holds the current generation.
-    current: usize,
+    ctx: GpuContext,
+    engine: Box<dyn Engine>,
+    kind: EngineKind,
+    start: Start,
     overlay: overlay::Overlay,
     sim: Sim,
     stats: Stats,
 }
 
-impl Gpu {
+impl App {
     async fn new(window: Arc<Window>) -> Self {
         // Honour wgpu's standard env vars, e.g. WGPU_BACKEND=dx12 or vulkan.
         let instance =
@@ -250,234 +172,34 @@ impl Gpu {
             .expect("surface not supported by adapter");
         surface.configure(&device, &config);
 
-        // --- Buffers -------------------------------------------------------
-
-        // Grid size: LIFE_GRID=<side> if set, else DEFAULT_GRID_SIDE; either way no
-        // bigger than the GPU's limits allow.
-        let requested = std::env::var("LIFE_GRID").ok().and_then(|s| s.trim().parse::<u32>().ok());
-        let mut grid = Grid::square(requested.unwrap_or(DEFAULT_GRID_SIDE));
-        if grid.bytes() > max_buffer {
-            log::warn!("{0}x{0} grid is too big for this GPU; shrinking", grid.width);
-            grid = Grid::square_fitting(max_buffer);
-        }
-        // The limits say what's addressable, not what's free: if allocation fails,
-        // shrink the grid and try again.
-        let cell_buffers = loop {
-            let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-            let buffers = [0, 1].map(|i| {
-                device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(&format!("cells {i}")),
-                    size: grid.bytes(),
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                })
-            });
-            match scope.pop().await {
-                None => break buffers,
-                Some(e) if grid.width > 1024 => {
-                    log::warn!("{}x{} grid didn't fit ({e}); shrinking", grid.width, grid.height);
-                    grid = Grid::square(grid.width * 3 / 4);
-                }
-                Some(e) => panic!("can't allocate even a small grid: {e}"),
-            }
-        };
-        log::info!(
-            "Grid {}x{} ({:.1} billion cells), {} MiB per buffer x 2",
-            grid.width,
-            grid.height,
-            grid.cells() as f64 / 1e9,
-            grid.bytes() >> 20
-        );
-
-        let params = Params {
-            width: grid.width,
-            height: grid.height,
-            words_per_row: grid.words_per_row(),
-            seed: 0,
-        };
-        let params_buffer = create_buffer_init(
-            &device,
-            "params",
-            bytemuck::bytes_of(&params),
-            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        );
-        let view_buffer = create_buffer_init(
-            &device,
-            "view",
-            bytemuck::bytes_of(&view_for(config.width, config.height, grid)),
-            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        );
-        let count_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("population counters"),
-            size: POP_COUNTERS * 4,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let count_staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("population readback"),
-            size: POP_COUNTERS * 4,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // --- Compute pipeline ----------------------------------------------
-
-        let life_shader = device.create_shader_module(wgpu::include_wgsl!("life.wgsl"));
-        let compute_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("compute layout"),
-            entries: &[
-                layout_entry(0, wgpu::ShaderStages::COMPUTE, wgpu::BufferBindingType::Uniform),
-                layout_entry(
-                    1,
-                    wgpu::ShaderStages::COMPUTE,
-                    wgpu::BufferBindingType::Storage { read_only: true },
-                ),
-                layout_entry(
-                    2,
-                    wgpu::ShaderStages::COMPUTE,
-                    wgpu::BufferBindingType::Storage { read_only: false },
-                ),
-                layout_entry(
-                    3,
-                    wgpu::ShaderStages::COMPUTE,
-                    wgpu::BufferBindingType::Storage { read_only: false },
-                ),
-            ],
-        });
-        let compute_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("compute pipeline layout"),
-                bind_group_layouts: &[Some(&compute_layout)],
-                ..Default::default()
-            });
-        let make_compute = |label: &str, entry_point: &str| {
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(label),
-                layout: Some(&compute_pipeline_layout),
-                module: &life_shader,
-                entry_point: Some(entry_point),
-                compilation_options: Default::default(),
-                cache: None,
-            })
-        };
-        let compute_pipeline = make_compute("life step", "step");
-        let seed_pipeline = make_compute("random seed", "seed");
-        let count_pipeline = make_compute("population count", "count");
-        let compute_bind_groups = [0, 1].map(|i| {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(&format!("compute {i} -> {}", 1 - i)),
-                layout: &compute_layout,
-                entries: &[
-                    bind(0, &params_buffer),
-                    bind(1, &cell_buffers[i]),
-                    bind(2, &cell_buffers[1 - i]),
-                    bind(3, &count_buffer),
-                ],
-            })
-        });
-
-        // --- Render pipeline -----------------------------------------------
-
-        let render_shader = device.create_shader_module(wgpu::include_wgsl!("render.wgsl"));
-        let render_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("render layout"),
-            entries: &[
-                layout_entry(0, wgpu::ShaderStages::FRAGMENT, wgpu::BufferBindingType::Uniform),
-                layout_entry(
-                    1,
-                    wgpu::ShaderStages::FRAGMENT,
-                    wgpu::BufferBindingType::Storage { read_only: true },
-                ),
-            ],
-        });
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("draw cells"),
-            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("render pipeline layout"),
-                bind_group_layouts: &[Some(&render_layout)],
-                ..Default::default()
-            })),
-            vertex: wgpu::VertexState {
-                module: &render_shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &render_shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(config.format.into())],
-            }),
-            primitive: Default::default(),
-            depth_stencil: None,
-            multisample: Default::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-        let render_bind_groups = [0, 1].map(|i| {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(&format!("render {i}")),
-                layout: &render_layout,
-                entries: &[bind(0, &view_buffer), bind(1, &cell_buffers[i])],
-            })
-        });
-
-        let mut overlay = overlay::Overlay::new(&device, config.format);
+        let ctx = GpuContext { device, queue, format: config.format, max_buffer };
+        let mut overlay = overlay::Overlay::new(&ctx.device, config.format);
         overlay.resize(config.width, config.height, window.scale_factor());
 
-        let mut gpu = Self {
+        let kind = EngineKind::Dense;
+        let mut engine = build_engine(&ctx, kind).await;
+        engine.random();
+
+        Self {
             window,
             surface,
-            device,
-            queue,
             config,
-            compute_pipeline,
-            seed_pipeline,
-            count_pipeline,
-            render_pipeline,
-            grid,
-            params_buffer,
-            count_buffer,
-            count_staging,
-            population: Population {
-                in_flight: None,
-                mapped: Default::default(),
-                last_request: Instant::now(),
-                value: None,
-            },
-            cell_buffers,
-            view_buffer,
-            compute_bind_groups,
-            render_bind_groups,
-            current: 0,
+            ctx,
+            engine,
+            kind,
+            start: Start::Random,
             overlay,
-            sim: Sim { paused: false, speed_level: 0, pending: 0.0, single_steps: 0, generation: 0 },
-            stats: Stats {
-                sample_start: Instant::now(),
-                frames: 0,
-                generations: 0,
-                fps: 0.0,
-                gens_per_sec: 0.0,
-            },
-        };
-        gpu.reseed();
-        gpu
+            sim: Sim { paused: false, speed_level: 0, pending: 0.0, single_steps: 0 },
+            stats: Stats::new(),
+        }
     }
 
     fn resize(&mut self, width: u32, height: u32) {
         if width > 0 && height > 0 {
             self.config.width = width;
             self.config.height = height;
-            self.surface.configure(&self.device, &self.config);
+            self.surface.configure(&self.ctx.device, &self.config);
             self.overlay.resize(width, height, self.window.scale_factor());
-            self.queue.write_buffer(
-                &self.view_buffer,
-                0,
-                bytemuck::bytes_of(&view_for(width, height, self.grid)),
-            );
         }
     }
 
@@ -486,181 +208,110 @@ impl Gpu {
         if event.state != ElementState::Pressed {
             return;
         }
-        let sim = &mut self.sim;
+        let fresh = !event.repeat;
         match &event.logical_key {
-            Key::Named(NamedKey::Space) if !event.repeat => {
-                sim.paused = !sim.paused;
-                sim.pending = 0.0;
+            Key::Named(NamedKey::Space) if fresh => {
+                self.sim.paused = !self.sim.paused;
+                self.sim.pending = 0.0;
             }
             // N may be held down to step repeatedly.
-            Key::Character(c) if c.eq_ignore_ascii_case("n") && sim.paused => {
-                sim.single_steps += 1;
+            Key::Character(c) if c.eq_ignore_ascii_case("n") && self.sim.paused => {
+                self.sim.single_steps += 1;
             }
-            Key::Character(c) if c.eq_ignore_ascii_case("r") && !event.repeat => self.reseed(),
-            Key::Character(c) if c == "1" && !event.repeat => {
-                self.load_pattern(patterns::GOSPER_GLIDER_GUN);
+            Key::Character(c) if c.eq_ignore_ascii_case("e") && fresh => self.switch_engine(),
+            Key::Character(c) if c.eq_ignore_ascii_case("t") && fresh => self.engine.toggle_tiles(),
+            Key::Character(c) if c.eq_ignore_ascii_case("r") && fresh => self.restart(Start::Random),
+            Key::Character(c) if c == "1" && fresh => {
+                self.restart(Start::Pattern(patterns::GOSPER_GLIDER_GUN));
             }
-            Key::Character(c) if c == "2" && !event.repeat => self.load_pattern(patterns::ACORN),
-            Key::Character(c) if c == "3" && !event.repeat => self.load_pattern(patterns::BUNNIES),
-            Key::Character(c) if c == "4" && !event.repeat => self.load_pattern(patterns::ARK1),
+            Key::Character(c) if c == "2" && fresh => self.restart(Start::Pattern(patterns::ACORN)),
+            Key::Character(c) if c == "3" && fresh => {
+                self.restart(Start::Pattern(patterns::BUNNIES));
+            }
+            Key::Character(c) if c == "4" && fresh => self.restart(Start::Pattern(patterns::ARK1)),
             Key::Character(c) if c == "+" || c == "=" => {
-                sim.speed_level = (sim.speed_level + 1).min(MAX_SPEED_LEVEL);
+                self.sim.speed_level = (self.sim.speed_level + 1).min(MAX_SPEED_LEVEL);
             }
             Key::Character(c) if c == "-" || c == "_" => {
-                sim.speed_level = (sim.speed_level - 1).max(MIN_SPEED_LEVEL);
+                self.sim.speed_level = (self.sim.speed_level - 1).max(MIN_SPEED_LEVEL);
             }
             _ => {}
         }
     }
 
-    /// Clear the grid and place `pattern` in the centre.
-    fn load_pattern(&mut self, pattern: &[&str]) {
-        // Clear on the GPU and submit *before* writing the pattern: queue writes are
-        // applied before the next submission, so they must come after this one.
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        encoder.clear_buffer(&self.cell_buffers[self.current], 0, None);
-        self.queue.submit([encoder.finish()]);
-
-        let (w, h) = (self.grid.width as i32, self.grid.height as i32);
-        let mut words: BTreeMap<u32, u32> = BTreeMap::new();
-        for (dx, dy) in patterns::centered(pattern) {
-            let x = (w / 2 + dx).rem_euclid(w) as u32;
-            let y = (h / 2 + dy).rem_euclid(h) as u32;
-            *words.entry(y * self.grid.words_per_row() + x / 32).or_default() |= 1 << (x % 32);
+    /// Load `start` into the current engine and remember it for engine switches.
+    fn restart(&mut self, start: Start) {
+        self.start = start;
+        match start {
+            Start::Random => self.engine.random(),
+            Start::Pattern(pattern) => self.engine.load(&patterns::centered(pattern)),
         }
-        for (index, word) in words {
-            self.queue.write_buffer(
-                &self.cell_buffers[self.current],
-                u64::from(index) * 4,
-                bytemuck::bytes_of(&word),
-            );
-        }
-        self.restart();
-    }
-
-    /// Fill the current generation with random soup, generated on the GPU.
-    fn reseed(&mut self) {
-        let params = Params {
-            width: self.grid.width,
-            height: self.grid.height,
-            words_per_row: self.grid.words_per_row(),
-            seed: time_seed(),
-        };
-        self.queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.seed_pipeline);
-            // This bind group writes `dst` = the current buffer.
-            pass.set_bind_group(0, &self.compute_bind_groups[1 - self.current], &[]);
-            let (x, y) = self.grid.dispatch_size();
-            pass.dispatch_workgroups(x, y, 1);
-        }
-        self.queue.submit([encoder.finish()]);
-        self.restart();
-    }
-
-    fn restart(&mut self) {
-        self.sim.generation = 0;
         self.sim.pending = 0.0;
-        // Count the new world promptly (an in-flight count of the old one is still
-        // collected, but labelled with its own generation).
-        self.population.value = None;
-        self.population.last_request = Instant::now() - POPULATION_PERIOD;
     }
 
-    /// Collect a finished population readback, and start a new one when due.
-    /// Must be called after this frame's generations have been submitted.
-    fn update_population(&mut self) {
-        use std::sync::atomic::Ordering;
-        let _ = self.device.poll(wgpu::PollType::Poll);
-        let pop = &mut self.population;
-        if let Some(generation) = pop.in_flight {
-            if !pop.mapped.load(Ordering::Acquire) {
-                return;
-            }
-            let total: u64 = {
-                let view = self.count_staging.get_mapped_range(..).expect("mapped counts");
-                bytemuck::cast_slice::<u8, u32>(&view).iter().map(|&c| u64::from(c)).sum()
-            };
-            self.count_staging.unmap();
-            pop.in_flight = None;
-            pop.value = Some((total, generation));
-        }
-        if pop.last_request.elapsed() < POPULATION_PERIOD {
-            return;
-        }
-        pop.last_request = Instant::now();
-        pop.in_flight = Some(self.sim.generation);
-        pop.mapped.store(false, Ordering::Release);
-
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        encoder.clear_buffer(&self.count_buffer, 0, None);
-        {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.count_pipeline);
-            // This bind group's `src` is the current generation.
-            pass.set_bind_group(0, &self.compute_bind_groups[self.current], &[]);
-            let (x, y) = self.grid.dispatch_size();
-            pass.dispatch_workgroups(x, y, 1);
-        }
-        encoder.copy_buffer_to_buffer(&self.count_buffer, 0, &self.count_staging, 0, None);
-        self.queue.submit([encoder.finish()]);
-        let mapped = pop.mapped.clone();
-        self.count_staging.map_async(wgpu::MapMode::Read, .., move |result| {
-            if result.is_ok() {
-                mapped.store(true, Ordering::Release);
-            }
-        });
+    /// Swap to the other engine and restart the current pattern in it.
+    fn switch_engine(&mut self) {
+        let next = match self.kind {
+            EngineKind::Dense => EngineKind::Sparse,
+            EngineKind::Sparse => EngineKind::Dense,
+        };
+        log::info!("Switching engine: {:?} -> {next:?}", self.kind);
+        // Free the old engine's GPU memory before allocating the new one's: make the
+        // current engine a tiny placeholder, drop the real one, then build.
+        let old = std::mem::replace(&mut self.engine, Box::new(Placeholder));
+        drop(old);
+        let _ = self.ctx.device.poll(wgpu::PollType::wait_indefinitely());
+        self.engine = pollster::block_on(build_engine(&self.ctx, next));
+        self.kind = next;
+        // Speeds don't carry over meaningfully between engines.
+        self.stats = Stats::new();
+        self.restart(self.start);
     }
 
     fn overlay_text(&self) -> String {
-        let (sim, stats) = (&self.sim, &self.stats);
+        let (sim, stats, engine) = (&self.sim, &self.stats, &self.engine);
         let ms = if stats.fps > 0.0 { 1000.0 / stats.fps } else { 0.0 };
         let state = if sim.paused { "  PAUSED" } else { "" };
-        let cell_rate = human(stats.gens_per_sec * self.grid.cells() as f64, &[
+        let cell_rate = human(stats.gens_per_sec * engine.cells_per_generation() as f64, &[
             (1e12, "TRILLION"),
             (1e9, "BILLION"),
             (1e6, "MILLION"),
         ]);
-        let memory = human(self.grid.bytes() as f64, &[
-            (f64::from(1 << 30), "GB"),
-            (f64::from(1 << 20), "MB"),
-            (f64::from(1 << 10), "KB"),
-        ]);
-        let population = match self.population.value {
+        let population = match engine.population() {
             Some((cells, generation)) => format!("POP {cells} AT GEN {generation}"),
             None => "POP COUNTING".to_owned(),
         };
         format!(
-            "{:.0} FPS  {ms:.2} MS\n\
+            "{}\n\
+             {:.0} FPS  {ms:.2} MS\n\
              GEN {}  {:.0} GEN/S  {cell_rate} CELLS/S\n\
              {population}\n\
              SPEED {} GEN/FRAME{state}\n\
-             GRID {}X{}  {memory} X 2\n\
-             SPACE PAUSE  N STEP  R RESEED  +/- SPEED\n\
-             1 GUN  2 ACORN  3 BUNNIES  4 ARK1",
+             {}\n\
+             SPACE PAUSE  N STEP  R RANDOM  +/- SPEED  E SWITCH ENGINE\n\
+             1 GUN  2 ACORN  3 BUNNIES  4 ARK1  T SHOW TILES",
+            engine.title(),
             stats.fps,
-            sim.generation,
+            engine.generation(),
             stats.gens_per_sec,
             sim.speed_label(),
-            self.grid.width,
-            self.grid.height,
+            engine.info(),
         )
     }
 
     /// Advance the simulation as needed and draw a frame.
     fn frame(&mut self) {
         use wgpu::CurrentSurfaceTexture as Cst;
+        let device = &self.ctx.device;
         let frame = match self.surface.get_current_texture() {
             Cst::Success(frame) => frame,
             Cst::Suboptimal(frame) => {
                 // Draw this one, but reconfigure so the next frame is a perfect fit.
-                self.surface.configure(&self.device, &self.config);
+                self.surface.configure(device, &self.config);
                 frame
             }
             Cst::Outdated | Cst::Lost => {
-                self.surface.configure(&self.device, &self.config);
+                self.surface.configure(device, &self.config);
                 return;
             }
             Cst::Timeout | Cst::Occluded => return,
@@ -677,35 +328,14 @@ impl Gpu {
             // throughput; if the GPU can't keep up with the requested speed, drop
             // the excess rather than falling further behind.
             let budget = (self.stats.gens_per_sec * FRAME_BUDGET.as_secs_f64()).max(1.0) as u32;
-            generations = generations.min(budget.max(1));
+            generations = generations.min(budget);
         }
-        let (dispatch_x, dispatch_y) = self.grid.dispatch_size();
-        // Submit the simulation in chunks: the NVIDIA Vulkan driver (560.94) crashes
-        // with STATUS_INTEGER_DIVIDE_BY_ZERO when one submission holds ~1024 dispatches.
-        let mut remaining = generations;
-        while remaining > 0 {
-            let chunk = remaining.min(MAX_GENERATIONS_PER_SUBMIT);
-            remaining -= chunk;
-            let mut encoder = self.device.create_command_encoder(&Default::default());
-            {
-                // Each dispatch is its own synchronization scope, so ping-ponging
-                // between bind groups inside one pass is safe.
-                let mut pass = encoder.begin_compute_pass(&Default::default());
-                pass.set_pipeline(&self.compute_pipeline);
-                for _ in 0..chunk {
-                    pass.set_bind_group(0, &self.compute_bind_groups[self.current], &[]);
-                    pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
-                    self.current = 1 - self.current;
-                }
-            }
-            self.queue.submit([encoder.finish()]);
-        }
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        self.sim.generation += u64::from(generations);
+        self.engine.step(generations);
         self.stats.record(generations);
-        self.update_population();
+        self.engine.update(self.config.width, self.config.height);
         self.overlay.set_text(&self.overlay_text());
 
+        let mut encoder = self.ctx.device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("draw"),
@@ -720,86 +350,57 @@ impl Gpu {
                 })],
                 ..Default::default()
             });
-            pass.set_pipeline(&self.render_pipeline);
-            pass.set_bind_group(0, &self.render_bind_groups[self.current], &[]);
-            pass.draw(0..3, 0..1);
-            self.overlay.draw(&self.queue, &mut pass);
+            self.engine.draw(&mut pass);
+            self.overlay.draw(&self.ctx.queue, &mut pass);
         }
 
-        self.queue.submit([encoder.finish()]);
+        self.ctx.queue.submit([encoder.finish()]);
         self.window.pre_present_notify();
-        self.queue.present(frame);
+        self.ctx.queue.present(frame);
     }
 }
 
-/// Format `value` with the largest unit it reaches, e.g. "1.4 TRILLION" or "512.0 KB".
-fn human(value: f64, units: &[(f64, &str)]) -> String {
-    match units.iter().find(|(scale, _)| value >= *scale) {
-        Some((scale, name)) => format!("{:.1} {name}", value / scale),
-        None => format!("{value:.0}"),
+async fn build_engine(ctx: &GpuContext, kind: EngineKind) -> Box<dyn Engine> {
+    match kind {
+        EngineKind::Dense => Box::new(dense::DenseEngine::new(ctx).await),
+        EngineKind::Sparse => Box::new(sparse::SparseEngine::new(ctx)),
     }
 }
 
-/// Draw the middle of `grid` at the middle of a `width` x `height` surface.
-fn view_for(width: u32, height: u32, grid: Grid) -> View {
-    View {
-        grid: [grid.width, grid.height],
-        offset: [
-            (width as i32 - grid.width as i32) / 2,
-            (height as i32 - grid.height as i32) / 2,
-        ],
-        words_per_row: grid.words_per_row(),
-        _pad: 0,
+/// Stands in for an engine for the instant between dropping one and building the next.
+struct Placeholder;
+
+impl Engine for Placeholder {
+    fn title(&self) -> String {
+        String::new()
     }
-}
-
-fn create_buffer_init(
-    device: &wgpu::Device,
-    label: &str,
-    contents: &[u8],
-    usage: wgpu::BufferUsages,
-) -> wgpu::Buffer {
-    use wgpu::util::DeviceExt;
-    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some(label),
-        contents,
-        usage,
-    })
-}
-
-fn layout_entry(
-    binding: u32,
-    visibility: wgpu::ShaderStages,
-    ty: wgpu::BufferBindingType,
-) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility,
-        ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
-        count: None,
+    fn info(&self) -> String {
+        String::new()
     }
-}
-
-fn bind(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
-    wgpu::BindGroupEntry { binding, resource: buffer.as_entire_binding() }
-}
-
-fn time_seed() -> u32 {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    nanos
+    fn generation(&self) -> u64 {
+        0
+    }
+    fn population(&self) -> Option<(u64, u64)> {
+        None
+    }
+    fn cells_per_generation(&self) -> u64 {
+        0
+    }
+    fn load(&mut self, _: &[(i32, i32)]) {}
+    fn random(&mut self) {}
+    fn step(&mut self, _: u32) {}
+    fn update(&mut self, _: u32, _: u32) {}
+    fn draw(&self, _: &mut wgpu::RenderPass<'_>) {}
 }
 
 #[derive(Default)]
-struct App {
-    gpu: Option<Gpu>,
+struct Handler {
+    app: Option<App>,
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler for Handler {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.gpu.is_some() {
+        if self.app.is_some() {
             return;
         }
         // Physical size so one cell maps to exactly one screen pixel.
@@ -807,23 +408,23 @@ impl ApplicationHandler for App {
             .with_title("GPU Conway's Game of Life")
             .with_inner_size(winit::dpi::PhysicalSize::new(1000, 1000));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
-        self.gpu = Some(pollster::block_on(Gpu::new(window)));
+        self.app = Some(pollster::block_on(App::new(window)));
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let Some(gpu) = self.gpu.as_mut() else { return };
+        let Some(app) = self.app.as_mut() else { return };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => gpu.resize(size.width, size.height),
-            WindowEvent::KeyboardInput { event, .. } => gpu.key(&event),
-            WindowEvent::RedrawRequested => gpu.frame(),
+            WindowEvent::Resized(size) => app.resize(size.width, size.height),
+            WindowEvent::KeyboardInput { event, .. } => app.key(&event),
+            WindowEvent::RedrawRequested => app.frame(),
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(gpu) = &self.gpu {
-            gpu.window.request_redraw();
+        if let Some(app) = &self.app {
+            app.window.request_redraw();
         }
     }
 }
@@ -838,5 +439,5 @@ fn main() {
     .init();
     let event_loop = EventLoop::new().expect("create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
-    event_loop.run_app(&mut App::default()).expect("run event loop");
+    event_loop.run_app(&mut Handler::default()).expect("run event loop");
 }
