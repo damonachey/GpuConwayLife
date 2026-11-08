@@ -3,6 +3,8 @@
 Conway's Game of Life running entirely on the GPU, written in Rust with
 [wgpu](https://wgpu.rs) and [winit](https://github.com/rust-windowing/winit).
 
+![Random soup on the dense engine's 16,384 × 16,384 grid, generation 788](docs/screenshot.png)
+
 Two simulation engines share one app; press **E** to switch between them.
 Switching frees the current engine's GPU memory, builds the other one and
 restarts whatever was last loaded (random soup or a pattern).
